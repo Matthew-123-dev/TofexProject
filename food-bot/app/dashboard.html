@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restaurant admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <style>
+    body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    .toggle-dot { transition: transform .2s ease; }
+    .toggle-on .toggle-dot { transform: translateX(1.25rem); }
+  </style>
+</head>
+<body class="min-h-screen bg-stone-50 text-stone-900">
+  <div class="flex min-h-screen">
+    <aside class="hidden w-64 shrink-0 border-r border-stone-200 bg-white p-5 md:block">
+      <div class="mb-10 flex items-center gap-3">
+        <div class="grid h-10 w-10 place-items-center rounded-xl bg-red-800 text-lg font-bold text-white">F</div>
+        <div><p class="font-bold">FoodBot</p><p class="text-xs text-stone-500">Staff dashboard</p></div>
+      </div>
+      <nav class="space-y-2 text-sm">
+        <a href="#overview" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="layout-dashboard" class="h-4 w-4"></i>Dashboard</a>
+        <a href="#menu" class="flex items-center gap-3 rounded-xl bg-red-50 px-3 py-3 font-semibold text-red-800"><i data-lucide="utensils" class="h-4 w-4"></i>Manage Menu</a>
+        <a href="#stock" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="boxes" class="h-4 w-4"></i>Stock Control</a>
+        <a href="#orders" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="receipt" class="h-4 w-4"></i>Orders</a>
+      </nav>
+    </aside>
+    <main class="w-full p-5 sm:p-8">
+      <header class="mx-auto flex max-w-7xl items-start justify-between">
+        <div><p class="text-sm font-medium text-red-800">Restaurant operations</p><h1 class="mt-1 text-3xl font-bold tracking-tight">Manage your menu</h1><p class="mt-2 text-stone-500">Keep prices, stock, and availability up to date.</p></div>
+        <button onclick="openAdd()" class="hidden items-center gap-2 rounded-xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-stone-700 sm:flex"><i data-lucide="plus" class="h-4 w-4"></i>Add item</button>
+      </header>
+      <div id="notice" class="mx-auto mt-5 hidden max-w-7xl rounded-xl px-4 py-3 text-sm"></div>
+      <section id="overview" class="mx-auto mt-8 grid max-w-7xl grid-cols-2 gap-4 lg:grid-cols-4">
+        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Menu items</p><p id="stat-items" class="mt-2 text-2xl font-bold">—</p></div>
+        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Available now</p><p id="stat-available" class="mt-2 text-2xl font-bold text-red-800">—</p></div>
+        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Pending orders</p><p id="stat-pending" class="mt-2 text-2xl font-bold">—</p></div>
+        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Last sync</p><p id="last-sync" class="mt-2 text-sm font-semibold">—</p></div>
+      </section>
+      <section id="menu" class="mx-auto mt-8 max-w-7xl">
+        <div class="mb-4 flex items-center justify-between"><div><h2 class="text-xl font-bold">Menu items</h2><p class="text-sm text-stone-500">Edit values directly, then save all changes.</p></div><button onclick="saveAll()" class="rounded-xl bg-red-800 px-5 py-3 text-sm font-semibold text-white shadow-sm hover:bg-red-900">Save all changes</button></div>
+        <div id="menu-grid" class="grid gap-5 sm:grid-cols-2 xl:grid-cols-3"></div>
+      </section>
+      <section id="orders" class="mx-auto mt-12 max-w-7xl">
+        <div class="mb-4"><h2 class="text-xl font-bold">Orders awaiting review</h2><p class="text-sm text-stone-500">Confirm or reject payment batches sent by WhatsApp customers.</p></div>
+        <div id="orders-list" class="grid gap-5 lg:grid-cols-2"></div>
+      </section>
+    </main>
+  </div>
+  <dialog id="add-dialog" class="rounded-2xl border-0 p-0 shadow-xl backdrop:bg-stone-900/30">
+    <form method="dialog" onsubmit="addItem(event)" class="w-[min(92vw,30rem)] space-y-4 p-6"><div class="flex justify-between"><h2 class="text-xl font-bold">Add menu item</h2><button class="text-stone-400">✕</button></div><input id="new-name" required placeholder="Item name" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-category" required placeholder="Category" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-price" required min="0" step="0.01" type="number" placeholder="Price (₦)" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-description" placeholder="Short description" class="w-full rounded-xl border border-stone-200 px-3 py-3"><button class="w-full rounded-xl bg-red-800 py-3 font-semibold text-white">Add item</button></form>
+  </dialog>
+  <script>
+    let items = [];
+    const money = value => `₦${Number(value).toLocaleString('en-NG')}`;
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+    function showNotice(text, good=true) { const el=document.querySelector('#notice'); el.textContent=text; el.className=`mx-auto mt-5 max-w-7xl rounded-xl px-4 py-3 text-sm ${good?'bg-green-50 text-green-800':'bg-red-50 text-red-800'}`; setTimeout(()=>el.classList.add('hidden'),3500); }
+    async function load() { const [m,o]=await Promise.all([fetch('/api/menu'),fetch('/api/orders')]); if(!m.ok||!o.ok) throw Error('Could not load dashboard data'); items=await m.json(); renderMenu(); renderOrders(await o.json()); document.querySelector('#last-sync').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+    function renderMenu() { document.querySelector('#stat-items').textContent=items.length; document.querySelector('#stat-available').textContent=items.filter(i=>i.is_available).length; document.querySelector('#menu-grid').innerHTML=items.map((i,n)=>`<article class="overflow-hidden rounded-2xl bg-white shadow-sm"><div class="grid h-36 place-items-center bg-gradient-to-br from-red-100 via-orange-50 to-stone-100"><i data-lucide="utensils" class="h-12 w-12 text-red-800/30"></i></div><div class="space-y-4 p-5"><div><p class="text-xs font-semibold uppercase tracking-wide text-red-800">${escapeHtml(i.category)}</p><h3 class="mt-1 text-lg font-bold">${escapeHtml(i.name)}</h3><p class="mt-1 text-sm text-stone-500">${escapeHtml(i.description||'No description yet')}</p></div><label class="block text-sm font-medium">Price (₦)<input data-field="price" data-index="${n}" type="number" min="0" step="0.01" value="${i.price}" class="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2.5 outline-none focus:border-red-800"></label><label class="block text-sm font-medium">Stock count <span class="font-normal text-stone-400">(blank = availability only)</span><input data-field="stock_quantity" data-index="${n}" type="number" min="0" step="1" value="${i.stock_quantity??''}" class="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2.5 outline-none focus:border-red-800"></label><button onclick="toggle(${n})" class="toggle ${i.is_available?'toggle-on bg-red-800':'bg-stone-300'} flex w-full items-center justify-between rounded-full px-3 py-2 text-sm font-semibold text-white"><span>${i.is_available?'Available':'Out of stock'}</span><span class="toggle-dot block h-5 w-5 rounded-full bg-white"></span></button></div></article>`).join(''); lucide.createIcons(); }
+    function toggle(n) { items[n].is_available=!items[n].is_available; renderMenu(); }
+    function collect() { document.querySelectorAll('[data-field]').forEach(el=>{ const item=items[el.dataset.index]; item[el.dataset.field]=el.value===''?null:el.value; }); }
+    async function saveAll() { collect(); const responses=await Promise.all(items.map(i=>fetch(`/api/menu/${i.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({...i,price:Number(i.price),stock_quantity:i.stock_quantity===null?null:Number(i.stock_quantity)})}))); if(responses.every(r=>r.ok)){showNotice('All menu changes saved.'); await load();} else showNotice('Some changes could not be saved.',false); }
+    function openAdd(){document.querySelector('#add-dialog').showModal();}
+    async function addItem(event){event.preventDefault(); const body={name:document.querySelector('#new-name').value,category:document.querySelector('#new-category').value,price:Number(document.querySelector('#new-price').value),description:document.querySelector('#new-description').value||null,stock_quantity:null,low_stock_threshold:0,is_available:true}; const r=await fetch('/api/menu',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(r.ok){document.querySelector('#add-dialog').close();event.target.reset();showNotice('Menu item added.');load();}else showNotice('Could not add item.',false);}
+    function renderOrders(orders) { document.querySelector('#stat-pending').textContent=orders.filter(o=>o.status==='pending').length; const pending=orders.filter(o=>o.status==='pending'); document.querySelector('#orders-list').innerHTML=pending.length?pending.map(o=>`<article class="rounded-2xl bg-white p-5 shadow-sm"><div class="flex items-start justify-between"><div><p class="text-xs font-semibold uppercase tracking-wide text-red-800">Payment batch #${o.id}</p><h3 class="mt-1 font-bold">${escapeHtml(o.customer)}</h3><p class="text-sm text-stone-500">${escapeHtml(o.phone_number)}</p></div><span class="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">Pending</span></div><div class="my-4 space-y-2 border-y border-stone-100 py-4">${o.orders.flatMap(order=>order.items.map(item=>`<div class="flex justify-between text-sm"><span>${item.quantity} × ${escapeHtml(item.name)}</span><span>${money(item.subtotal)}</span></div>`)).join('')}</div><div class="flex items-center justify-between"><span class="font-bold">${money(o.total_amount)}</span><div class="flex gap-2"><button onclick="review(${o.id},'reject')" class="rounded-xl border border-stone-200 px-4 py-2 text-sm font-semibold">Reject</button><button onclick="review(${o.id},'approve')" class="rounded-xl bg-red-800 px-4 py-2 text-sm font-semibold text-white">Approve</button></div></div></article>`).join(''):'<div class="rounded-2xl bg-white p-8 text-center text-stone-500 shadow-sm">No orders waiting for review.</div>'; }
+    async function review(id,action){const r=await fetch(`/api/orders/${id}/${action}`,{method:'POST'}); if(r.ok){showNotice(action==='approve'?'Order approved.':'Order rejected.');load();}else{const data=await r.json();showNotice(data.detail||'Could not update order.',false);}}
+    load().catch(error=>showNotice(error.message,false));
+  </script>
+</body>
+</html>
