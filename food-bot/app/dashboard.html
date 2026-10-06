@@ -3,69 +3,70 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Restaurant admin</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <title>Tofex staff dashboard</title>
   <style>
-    body { font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
-    .toggle-dot { transition: transform .2s ease; }
-    .toggle-on .toggle-dot { transform: translateX(1.25rem); }
+    :root { --maroon:#7f1d1d; --cream:#fafaf9; --ink:#1c1917; --muted:#78716c; --line:#e7e5e4; }
+    * { box-sizing:border-box; } body { margin:0; background:var(--cream); color:var(--ink); font:15px system-ui,sans-serif; }
+    .layout { display:grid; grid-template-columns:220px 1fr; min-height:100vh; } aside { padding:24px 16px; border-right:1px solid var(--line); background:#fff; }
+    main { width:min(1200px,100%); padding:28px; } nav { display:grid; gap:6px; margin-top:32px; } nav a { padding:11px 12px; border-radius:10px; color:var(--muted); text-decoration:none; }
+    nav a:hover, nav a.active { background:#fef2f2; color:var(--maroon); font-weight:700; } h1,h2,h3,p { margin-top:0; } h1 { margin-bottom:8px; } .muted { color:var(--muted); }
+    .toolbar, .card-head, .actions { display:flex; gap:10px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    .panel, .card { padding:20px; border:1px solid var(--line); border-radius:16px; background:#fff; box-shadow:0 2px 8px #1c191508; }
+    .stats, .grid { display:grid; gap:16px; } .stats { grid-template-columns:repeat(4,1fr); margin:28px 0; } .grid { grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); }
+    .stat strong { display:block; margin-top:8px; font-size:26px; } section { margin-top:28px; } label { display:grid; gap:5px; color:var(--muted); font-size:13px; font-weight:600; }
+    input, select { width:100%; padding:10px 11px; border:1px solid var(--line); border-radius:9px; background:#fff; color:var(--ink); font:inherit; }
+    button { border:0; border-radius:9px; padding:10px 14px; cursor:pointer; font:inherit; font-weight:700; } .primary { background:var(--maroon); color:#fff; } .secondary { border:1px solid var(--line); background:#fff; } .danger { color:#991b1b; border:1px solid #fecaca; background:#fff; }
+    .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; align-items:end; } .badge { display:inline-block; padding:4px 9px; border-radius:999px; background:#fef3c7; color:#92400e; font-size:12px; font-weight:700; }
+    .inactive { opacity:.65; } .notice { margin-top:16px; padding:11px 13px; border-radius:9px; background:#ecfdf5; color:#166534; } .notice.error { background:#fef2f2; color:#991b1b; }
+    @media (max-width:760px) { .layout { display:block; } aside { border-right:0; border-bottom:1px solid var(--line); } nav { display:flex; overflow:auto; margin-top:16px; } main { padding:18px; } .stats { grid-template-columns:repeat(2,1fr); } }
   </style>
 </head>
-<body class="min-h-screen bg-stone-50 text-stone-900">
-  <div class="flex min-h-screen">
-    <aside class="hidden w-64 shrink-0 border-r border-stone-200 bg-white p-5 md:block">
-      <div class="mb-10 flex items-center gap-3">
-        <div class="grid h-10 w-10 place-items-center rounded-xl bg-red-800 text-lg font-bold text-white">F</div>
-        <div><p class="font-bold">FoodBot</p><p class="text-xs text-stone-500">Staff dashboard</p></div>
-      </div>
-      <nav class="space-y-2 text-sm">
-        <a href="#overview" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="layout-dashboard" class="h-4 w-4"></i>Dashboard</a>
-        <a href="#menu" class="flex items-center gap-3 rounded-xl bg-red-50 px-3 py-3 font-semibold text-red-800"><i data-lucide="utensils" class="h-4 w-4"></i>Manage Menu</a>
-        <a href="#stock" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="boxes" class="h-4 w-4"></i>Stock Control</a>
-        <a href="#orders" class="flex items-center gap-3 rounded-xl px-3 py-3 text-stone-500 hover:bg-stone-50"><i data-lucide="receipt" class="h-4 w-4"></i>Orders</a>
+<body>
+  <div class="layout">
+    <aside>
+      <strong>Tofex</strong><div class="muted">Staff dashboard</div>
+      <nav>
+        <a href="#menu">Manage Menu</a><a href="#orders">Orders</a><a href="#riders">Riders</a><a href="#areas">Delivery areas</a>
       </nav>
     </aside>
-    <main class="w-full p-5 sm:p-8">
-      <header class="mx-auto flex max-w-7xl items-start justify-between">
-        <div><p class="text-sm font-medium text-red-800">Restaurant operations</p><h1 class="mt-1 text-3xl font-bold tracking-tight">Manage your menu</h1><p class="mt-2 text-stone-500">Keep prices, stock, and availability up to date.</p></div>
-        <button onclick="openAdd()" class="hidden items-center gap-2 rounded-xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-stone-700 sm:flex"><i data-lucide="plus" class="h-4 w-4"></i>Add item</button>
-      </header>
-      <div id="notice" class="mx-auto mt-5 hidden max-w-7xl rounded-xl px-4 py-3 text-sm"></div>
-      <section id="overview" class="mx-auto mt-8 grid max-w-7xl grid-cols-2 gap-4 lg:grid-cols-4">
-        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Menu items</p><p id="stat-items" class="mt-2 text-2xl font-bold">—</p></div>
-        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Available now</p><p id="stat-available" class="mt-2 text-2xl font-bold text-red-800">—</p></div>
-        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Pending orders</p><p id="stat-pending" class="mt-2 text-2xl font-bold">—</p></div>
-        <div class="rounded-2xl bg-white p-5 shadow-sm"><p class="text-sm text-stone-500">Last sync</p><p id="last-sync" class="mt-2 text-sm font-semibold">—</p></div>
-      </section>
-      <section id="menu" class="mx-auto mt-8 max-w-7xl">
-        <div class="mb-4 flex items-center justify-between"><div><h2 class="text-xl font-bold">Menu items</h2><p class="text-sm text-stone-500">Edit values directly, then save all changes.</p></div><button onclick="saveAll()" class="rounded-xl bg-red-800 px-5 py-3 text-sm font-semibold text-white shadow-sm hover:bg-red-900">Save all changes</button></div>
-        <div id="menu-grid" class="grid gap-5 sm:grid-cols-2 xl:grid-cols-3"></div>
-      </section>
-      <section id="orders" class="mx-auto mt-12 max-w-7xl">
-        <div class="mb-4"><h2 class="text-xl font-bold">Orders awaiting review</h2><p class="text-sm text-stone-500">Confirm or reject payment batches sent by WhatsApp customers.</p></div>
-        <div id="orders-list" class="grid gap-5 lg:grid-cols-2"></div>
-      </section>
+    <main>
+      <header><div class="muted">Restaurant operations</div><h1>Staff dashboard</h1><p class="muted">Manage menu, delivery partners and service areas.</p></header>
+      <div id="notice" hidden></div>
+      <div class="stats">
+        <div class="panel stat"><span class="muted">Menu items</span><strong id="stat-items">—</strong></div>
+        <div class="panel stat"><span class="muted">Available now</span><strong id="stat-available">—</strong></div>
+        <div class="panel stat"><span class="muted">Pending orders</span><strong id="stat-pending">—</strong></div>
+        <div class="panel stat"><span class="muted">Last sync</span><strong id="last-sync">—</strong></div>
+      </div>
+      <section id="menu"><div class="toolbar"><div><h2>Menu items</h2><p class="muted">Edit prices, stock and availability.</p></div><button class="primary" onclick="openAdd()">Add item</button></div><div id="menu-grid" class="grid"></div></section>
+      <section id="orders"><h2>Orders</h2><p class="muted">Existing payment review remains available here.</p><div id="orders-list" class="grid"></div></section>
+      <section id="riders"><div class="toolbar"><div><h2>Riders</h2><p class="muted">Archived riders are retained and cannot be dispatched.</p></div></div><form class="panel form-grid" onsubmit="saveRider(event)"><label>Name<input id="rider-name" required maxlength="120"></label><label>Phone<input id="rider-phone" required placeholder="08012345678"></label><button class="primary">Add rider</button></form><div id="riders-list" class="grid"></div></section>
+      <section id="areas"><h2>Delivery areas</h2><p class="muted">Disable an area to stop new selections while preserving existing orders.</p><form class="panel form-grid" onsubmit="saveArea(event)"><label>Name<input id="area-name" required maxlength="24"></label><label>Fee (₦)<input id="area-fee" required type="number" min="0" step=".01"></label><label>Expected minutes<input id="area-minutes" required type="number" min="1" max="1440"></label><label>Sort order<input id="area-sort" required type="number" min="0" value="0"></label><button class="primary">Add area</button></form><div id="areas-list" class="grid"></div></section>
     </main>
   </div>
-  <dialog id="add-dialog" class="rounded-2xl border-0 p-0 shadow-xl backdrop:bg-stone-900/30">
-    <form method="dialog" onsubmit="addItem(event)" class="w-[min(92vw,30rem)] space-y-4 p-6"><div class="flex justify-between"><h2 class="text-xl font-bold">Add menu item</h2><button class="text-stone-400">✕</button></div><input id="new-name" required placeholder="Item name" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-category" required placeholder="Category" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-price" required min="0" step="0.01" type="number" placeholder="Price (₦)" class="w-full rounded-xl border border-stone-200 px-3 py-3"><input id="new-description" placeholder="Short description" class="w-full rounded-xl border border-stone-200 px-3 py-3"><button class="w-full rounded-xl bg-red-800 py-3 font-semibold text-white">Add item</button></form>
-  </dialog>
+  <dialog id="add-dialog"><form method="dialog" onsubmit="addItem(event)"><h2>Add menu item</h2><p><input id="new-name" required placeholder="Item name"></p><p><input id="new-category" required placeholder="Category"></p><p><input id="new-price" required min="0" step=".01" type="number" placeholder="Price (₦)"></p><p><input id="new-description" placeholder="Description"></p><button class="primary">Add item</button> <button class="secondary">Cancel</button></form></dialog>
   <script>
-    let items = [];
-    const money = value => `₦${Number(value).toLocaleString('en-NG')}`;
-    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
-    function showNotice(text, good=true) { const el=document.querySelector('#notice'); el.textContent=text; el.className=`mx-auto mt-5 max-w-7xl rounded-xl px-4 py-3 text-sm ${good?'bg-green-50 text-green-800':'bg-red-50 text-red-800'}`; setTimeout(()=>el.classList.add('hidden'),3500); }
-    async function load() { const [m,o]=await Promise.all([fetch('/api/menu'),fetch('/api/orders')]); if(!m.ok||!o.ok) throw Error('Could not load dashboard data'); items=await m.json(); renderMenu(); renderOrders(await o.json()); document.querySelector('#last-sync').textContent=new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
-    function renderMenu() { document.querySelector('#stat-items').textContent=items.length; document.querySelector('#stat-available').textContent=items.filter(i=>i.is_available).length; document.querySelector('#menu-grid').innerHTML=items.map((i,n)=>`<article class="overflow-hidden rounded-2xl bg-white shadow-sm"><div class="grid h-36 place-items-center bg-gradient-to-br from-red-100 via-orange-50 to-stone-100"><i data-lucide="utensils" class="h-12 w-12 text-red-800/30"></i></div><div class="space-y-4 p-5"><div><p class="text-xs font-semibold uppercase tracking-wide text-red-800">${escapeHtml(i.category)}</p><h3 class="mt-1 text-lg font-bold">${escapeHtml(i.name)}</h3><p class="mt-1 text-sm text-stone-500">${escapeHtml(i.description||'No description yet')}</p></div><label class="block text-sm font-medium">Price (₦)<input data-field="price" data-index="${n}" type="number" min="0" step="0.01" value="${i.price}" class="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2.5 outline-none focus:border-red-800"></label><label class="block text-sm font-medium">Stock count <span class="font-normal text-stone-400">(blank = availability only)</span><input data-field="stock_quantity" data-index="${n}" type="number" min="0" step="1" value="${i.stock_quantity??''}" class="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2.5 outline-none focus:border-red-800"></label><button onclick="toggle(${n})" class="toggle ${i.is_available?'toggle-on bg-red-800':'bg-stone-300'} flex w-full items-center justify-between rounded-full px-3 py-2 text-sm font-semibold text-white"><span>${i.is_available?'Available':'Out of stock'}</span><span class="toggle-dot block h-5 w-5 rounded-full bg-white"></span></button></div></article>`).join(''); lucide.createIcons(); }
-    function toggle(n) { items[n].is_available=!items[n].is_available; renderMenu(); }
-    function collect() { document.querySelectorAll('[data-field]').forEach(el=>{ const item=items[el.dataset.index]; item[el.dataset.field]=el.value===''?null:el.value; }); }
-    async function saveAll() { collect(); const responses=await Promise.all(items.map(i=>fetch(`/api/menu/${i.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({...i,price:Number(i.price),stock_quantity:i.stock_quantity===null?null:Number(i.stock_quantity)})}))); if(responses.every(r=>r.ok)){showNotice('All menu changes saved.'); await load();} else showNotice('Some changes could not be saved.',false); }
+    let items=[], riders=[], areas=[];
+    const money=v=>`₦${Number(v).toLocaleString('en-NG')}`;
+    const escapeHtml=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+    const request=async(url,options={})=>{const r=await fetch(url,options);if(!r.ok){const d=await r.json().catch(()=>({}));throw Error(d.detail||'Request failed');}return r.status===204?null:r.json();};
+    function notice(text,error=false){const e=document.querySelector('#notice');e.hidden=false;e.textContent=text;e.className=`notice${error?' error':''}`;setTimeout(()=>e.hidden=true,3500);}
+    async function load(){try{[items,riders,areas]=await Promise.all([request('/api/menu'),request('/api/riders'),request('/api/delivery-areas')]);const orders=await request('/api/orders');renderMenu();renderOrders(orders);renderRiders();renderAreas();document.querySelector('#last-sync').textContent=new Date().toLocaleTimeString();}catch(e){notice(e.message,true);}}
+    function renderMenu(){document.querySelector('#stat-items').textContent=items.length;document.querySelector('#stat-available').textContent=items.filter(i=>i.is_available).length;document.querySelector('#menu-grid').innerHTML=items.map((i,n)=>`<article class="card"><div class="card-head"><h3>${escapeHtml(i.name)}</h3><span class="badge">${i.is_available?'Available':'Hidden'}</span></div><p class="muted">${escapeHtml(i.category)} · ${escapeHtml(i.description||'No description')}</p><label>Price (₦)<input data-field="price" data-index="${n}" type="number" min="0" step=".01" value="${escapeHtml(i.price)}"></label><label>Stock count<input data-field="stock_quantity" data-index="${n}" type="number" min="0" value="${i.stock_quantity??''}"></label><div class="actions"><button class="secondary" onclick="toggle(${n})">${i.is_available?'Hide':'Show'}</button></div></article>`).join('')||'<p class="muted">No menu items.</p>';}
+    function toggle(n){items[n].is_available=!items[n].is_available;renderMenu();}
+    function collect(){document.querySelectorAll('[data-field]').forEach(e=>{items[e.dataset.index][e.dataset.field]=e.value===''?null:e.value;});}
+    async function saveAll(){try{collect();await Promise.all(items.map(i=>request(`/api/menu/${i.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({...i,price:Number(i.price),stock_quantity:i.stock_quantity===null?null:Number(i.stock_quantity)})})));notice('Menu changes saved.');load();}catch(e){notice(e.message,true);}}
     function openAdd(){document.querySelector('#add-dialog').showModal();}
-    async function addItem(event){event.preventDefault(); const body={name:document.querySelector('#new-name').value,category:document.querySelector('#new-category').value,price:Number(document.querySelector('#new-price').value),description:document.querySelector('#new-description').value||null,stock_quantity:null,low_stock_threshold:0,is_available:true}; const r=await fetch('/api/menu',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(r.ok){document.querySelector('#add-dialog').close();event.target.reset();showNotice('Menu item added.');load();}else showNotice('Could not add item.',false);}
-    function renderOrders(orders) { document.querySelector('#stat-pending').textContent=orders.filter(o=>o.status==='pending').length; const pending=orders.filter(o=>o.status==='pending'); document.querySelector('#orders-list').innerHTML=pending.length?pending.map(o=>`<article class="rounded-2xl bg-white p-5 shadow-sm"><div class="flex items-start justify-between"><div><p class="text-xs font-semibold uppercase tracking-wide text-red-800">Payment batch #${o.id}</p><h3 class="mt-1 font-bold">${escapeHtml(o.customer)}</h3><p class="text-sm text-stone-500">${escapeHtml(o.phone_number)}</p></div><span class="rounded-full bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-700">Pending</span></div><div class="my-4 space-y-2 border-y border-stone-100 py-4">${o.orders.flatMap(order=>order.items.map(item=>`<div class="flex justify-between text-sm"><span>${item.quantity} × ${escapeHtml(item.name)}</span><span>${money(item.subtotal)}</span></div>`)).join('')}</div><div class="flex items-center justify-between"><span class="font-bold">${money(o.total_amount)}</span><div class="flex gap-2"><button onclick="review(${o.id},'reject')" class="rounded-xl border border-stone-200 px-4 py-2 text-sm font-semibold">Reject</button><button onclick="review(${o.id},'approve')" class="rounded-xl bg-red-800 px-4 py-2 text-sm font-semibold text-white">Approve</button></div></div></article>`).join(''):'<div class="rounded-2xl bg-white p-8 text-center text-stone-500 shadow-sm">No orders waiting for review.</div>'; }
-    async function review(id,action){const r=await fetch(`/api/orders/${id}/${action}`,{method:'POST'}); if(r.ok){showNotice(action==='approve'?'Order approved.':'Order rejected.');load();}else{const data=await r.json();showNotice(data.detail||'Could not update order.',false);}}
-    load().catch(error=>showNotice(error.message,false));
+    async function addItem(e){e.preventDefault();try{await request('/api/menu',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:newName.value,category:newCategory.value,price:Number(newPrice.value),description:newDescription.value||null,stock_quantity:null,low_stock_threshold:0,is_available:true})});e.target.closest('dialog').close();e.target.reset();notice('Menu item added.');load();}catch(err){notice(err.message,true);}}
+    function renderOrders(orders){document.querySelector('#stat-pending').textContent=orders.filter(o=>o.status==='pending').length;const pending=orders.filter(o=>o.status==='pending');document.querySelector('#orders-list').innerHTML=pending.map(o=>`<article class="card"><div class="card-head"><div><h3>Payment batch #${o.id}</h3><p class="muted">${escapeHtml(o.customer)} · ${escapeHtml(o.phone_number)}</p></div><span class="badge">Pending</span></div><p>${money(o.total_amount)}</p><div class="actions"><button class="danger" onclick="review(${o.id},'reject')">Reject</button><button class="primary" onclick="review(${o.id},'approve')">Approve</button></div></article>`).join('')||'<p class="muted">No orders waiting for review.</p>';}
+    async function review(id,action){if(!confirm(`${action==='approve'?'Approve':'Reject'} this order?`))return;try{await request(`/api/orders/${id}/${action}`,{method:'POST'});notice('Order updated.');load();}catch(e){notice(e.message,true);}}
+    function renderRiders(){document.querySelector('#riders-list').innerHTML=riders.map(r=>`<article class="card ${r.is_archived?'inactive':''}"><div class="card-head"><h3>${escapeHtml(r.name)}</h3><span class="badge">${r.is_archived?'Archived':r.is_active?'Active':'Inactive'}</span></div><p class="muted">${escapeHtml(r.phone_number)}</p>${r.is_archived?'':'<button class="danger" onclick="archiveRider('+r.id+')">Archive</button>'}</article>`).join('')||'<p class="muted">No riders yet.</p>';}
+    async function saveRider(e){e.preventDefault();try{await request('/api/riders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:riderName.value,phone_number:riderPhone.value,is_active:false})});e.target.reset();notice('Rider added.');load();}catch(err){notice(err.message,true);}}
+    async function archiveRider(id){if(!confirm('Archive this rider?'))return;try{await request(`/api/riders/${id}/archive`,{method:'POST'});notice('Rider archived.');load();}catch(e){notice(e.message,true);}}
+    function renderAreas(){document.querySelector('#areas-list').innerHTML=areas.map(a=>`<article class="card ${a.is_active?'':'inactive'}"><div class="card-head"><h3>${escapeHtml(a.name)}</h3><span class="badge">${a.is_active?'Active':'Disabled'}</span></div><p>${money(a.fee)} · about ${a.expected_minutes} minutes · order ${a.sort_order}</p><button class="secondary" onclick="toggleArea(${a.id},${!a.is_active})">${a.is_active?'Disable':'Enable'}</button></article>`).join('')||'<p class="muted">No delivery areas yet.</p>';}
+    async function toggleArea(id,is_active){try{const a=areas.find(x=>x.id===id);await request(`/api/delivery-areas/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({...a,is_active})});notice(`Area ${is_active?'enabled':'disabled'}.`);load();}catch(e){notice(e.message,true);}}
+    async function saveArea(e){e.preventDefault();try{await request('/api/delivery-areas',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:areaName.value,fee:Number(areaFee.value),expected_minutes:Number(areaMinutes.value),sort_order:Number(areaSort.value),is_active:true})});e.target.reset();areaSort.value=0;notice('Delivery area added.');load();}catch(err){notice(err.message,true);}}
+    load();
   </script>
 </body>
 </html>

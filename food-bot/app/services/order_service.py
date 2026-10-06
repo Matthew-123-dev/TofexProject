@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import delete, func, select
@@ -5,7 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.models import Cart, CartItem, MenuItem, Order, OrderItem, OrderStatus, PaymentBatch, User
+from app.models import (
+    Cart, CartItem, Fulfillment, FulfillmentStage, MenuItem, Order, OrderItem, OrderStatus, PaymentBatch, User,
+)
 from app.utils import naira
 
 
@@ -94,8 +97,8 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     subtotal = sum((cart_subtotal(lines) for _, lines in cart_lines), Decimal("0"))
     batch = PaymentBatch(
         user_id=user.id,
-        delivery_fee=settings.delivery_fee,
-        total_amount=subtotal + settings.delivery_fee,
+        delivery_fee=Decimal("0"),
+        total_amount=subtotal,
         status=OrderStatus.PENDING,
     )
     batch.orders = [
@@ -120,6 +123,12 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     ]
     session.add(batch)
     await session.flush()
+    batch.fulfillment = Fulfillment(
+        fulfillment_type="delivery",
+        stage=FulfillmentStage.COLLECTING_DETAILS,
+        checkout_step="choice",
+        timer_started_at=datetime.now(timezone.utc),
+    )
     await session.execute(delete(CartItem).where(CartItem.cart_id.in_([cart_id for cart_id, _ in cart_lines])))
     await session.flush()
     return batch

@@ -11,3 +11,7 @@ class IncomingMessage:
     text: str | None = None
     reply_id: str | None = None  # id of a tapped button or list row
     media_id: str | None = None  # WhatsApp media id (receipt photos)
+    latitude: float | None = None
+    longitude: float | None = None
+    location_name: str | None = None
+    location_address: str | None = None

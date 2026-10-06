@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     bank_account_number: str = ""
     bank_account_name: str = ""
 
+    brand_name: str = "Tofex Grill and More"
+    outlet_address: str = "[Outlet address - to be added]"
+    outlet_phone: str = "[Outlet phone - to be added]"
+    support_phone: str = "[Support phone - to be added]"
+    refund_timeframe: str = "[timeframe - to be added]"
+    maps_region_hint: str = "Lagos, Nigeria"
+    checkout_reminder_minutes: int = 10
+    checkout_cancel_minutes: int = 30
+    address_edit_timeout_minutes: int = 10
+    thank_you_delay_minutes: int = 10
+    rider_pickup_reminder_minutes: int = 10
+    rider_window_warning_hours: int = 23
+    overdue_grace_minutes: int = 10
+
     # Print outgoing messages instead of sending them, and expose /dev/outbox for the simulator.
     dry_run: bool = False
 

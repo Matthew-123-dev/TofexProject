@@ -18,12 +18,33 @@ class SessionState(str, enum.Enum):
     SELECTING_CARTS = "SELECTING_CARTS"
     EDITING_PROFILE = "EDITING_PROFILE"
     AWAITING_RECEIPT = "AWAITING_RECEIPT"
+    COLLECTING_DETAILS = "COLLECTING_DETAILS"
+    AWAITING_FEE_QUOTE = "AWAITING_FEE_QUOTE"
+    AWAITING_FEE_ACCEPT = "AWAITING_FEE_ACCEPT"
+    AWAITING_PAYMENT = "AWAITING_PAYMENT"
+    AWAITING_APPROVAL = "AWAITING_APPROVAL"
     COMPLETED = "COMPLETED"
 
 
 class OrderStatus(str, enum.Enum):
     PENDING = "pending"
     PAID = "paid"
+    CANCELLED = "cancelled"
+
+
+class FulfillmentStage(str, enum.Enum):
+    COLLECTING_DETAILS = "collecting_details"
+    AWAITING_FEE_QUOTE = "awaiting_fee_quote"
+    AWAITING_FEE_ACCEPT = "awaiting_fee_accept"
+    AWAITING_PAYMENT = "awaiting_payment"
+    AWAITING_APPROVAL = "awaiting_approval"
+    PREPARING = "preparing"
+    READY = "ready"
+    DISPATCHED = "dispatched"
+    OUT_FOR_DELIVERY = "out_for_delivery"
+    DELIVERED = "delivered"
+    COLLECTED = "collected"
+    FAILED = "failed"
     CANCELLED = "cancelled"
 
 
@@ -38,6 +59,7 @@ class User(Base):
         Enum(SessionState, native_enum=False, length=32), default=SessionState.BROWSING
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    saved_address: Mapped["SavedAddress | None"] = relationship(back_populates="user", uselist=False)
 
 
 class Cart(Base):
@@ -103,6 +125,9 @@ class PaymentBatch(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     orders: Mapped[list[Order]] = relationship(back_populates="payment_batch", cascade="all, delete-orphan")
+    fulfillment: Mapped["Fulfillment | None"] = relationship(
+        back_populates="payment_batch", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class Order(Base):
@@ -148,3 +173,104 @@ class ProcessedMessage(Base):
 
     message_id: Mapped[str] = mapped_column(String(200), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DeliveryArea(Base):
+    __tablename__ = "delivery_areas"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(24), unique=True)
+    fee: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    expected_minutes: Mapped[int] = mapped_column(Integer)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Rider(Base):
+    __tablename__ = "riders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    phone_number: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    window_warning_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pending_action: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SavedAddress(Base):
+    __tablename__ = "saved_addresses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), unique=True)
+    street: Mapped[str] = mapped_column(String(150))
+    area_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_areas.id", ondelete="SET NULL"))
+    area_name: Mapped[str] = mapped_column(String(120))
+    landmark: Mapped[str] = mapped_column(String(100))
+    phone2: Mapped[str | None] = mapped_column(String(32))
+    notes: Mapped[str | None] = mapped_column(String(200))
+    latitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
+    longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    user: Mapped[User] = relationship(back_populates="saved_address")
+    area: Mapped["DeliveryArea | None"] = relationship()
+
+
+class Fulfillment(Base):
+    __tablename__ = "fulfillments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("payment_batches.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    fulfillment_type: Mapped[str] = mapped_column(String(16))
+    stage: Mapped[FulfillmentStage] = mapped_column(
+        Enum(
+            FulfillmentStage,
+            native_enum=False,
+            length=32,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        index=True,
+    )
+    checkout_step: Mapped[str | None] = mapped_column(String(32))
+    street: Mapped[str | None] = mapped_column(String(150))
+    area_id: Mapped[int | None] = mapped_column(ForeignKey("delivery_areas.id", ondelete="SET NULL"))
+    area_name: Mapped[str | None] = mapped_column(String(120))
+    landmark: Mapped[str | None] = mapped_column(String(100))
+    phone2: Mapped[str | None] = mapped_column(String(32))
+    notes: Mapped[str | None] = mapped_column(String(200))
+    latitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
+    longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
+    expected_minutes: Mapped[int | None] = mapped_column(Integer)
+    rider_id: Mapped[int | None] = mapped_column(ForeignKey("riders.id", ondelete="SET NULL"))
+    timer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reminders_sent: Mapped[str] = mapped_column(Text, default="[]")
+    address_editing: Mapped[bool] = mapped_column(Boolean, default=False)
+    address_edit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatch_error: Mapped[str | None] = mapped_column(Text)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    picked_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    thank_you_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    thank_you_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rider_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failure_reasons: Mapped[str | None] = mapped_column(Text)
+    failure_note: Mapped[str | None] = mapped_column(Text)
+    failed_by: Mapped[str | None] = mapped_column(String(16))
+    not_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    not_received_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    payment_batch: Mapped[PaymentBatch] = relationship(back_populates="fulfillment")
+    area: Mapped["DeliveryArea | None"] = relationship()
+    rider: Mapped["Rider | None"] = relationship()

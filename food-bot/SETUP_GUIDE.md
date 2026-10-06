@@ -52,6 +52,19 @@ The dashboard supports:
 - Adding new menu items.
 - Reviewing payment batches.
 - Approving or rejecting orders.
+- Managing riders and delivery areas. Riders are archived rather than deleted,
+  and areas can be disabled without changing existing orders.
+
+Before applying the delivery foundation migration, make a database backup:
+
+```bash
+cp foodbot.db foodbot.db.bak
+alembic upgrade head
+```
+
+The foundation migration adds delivery areas, riders, saved addresses and
+fulfillment records. It does not backfill legacy batches, so older orders remain
+valid and continue to display through the existing order view.
 
 Approved or rejected payments still notify the customer through WhatsApp.
 

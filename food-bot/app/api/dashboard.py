@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -5,10 +6,12 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.database import async_session_factory
-from app.models import MenuItem, OrderStatus, PaymentBatch, SessionState
+from app.models import DeliveryArea, MenuItem, OrderStatus, PaymentBatch, Rider, SessionState
 from app.services import menu_service, order_service, whatsapp
+from app.utils import normalize_phone
 
 router = APIRouter(tags=["dashboard"])
 HTML_PATH = Path(__file__).resolve().parents[1] / "dashboard.html"
@@ -22,6 +25,20 @@ class MenuItemInput(BaseModel):
     stock_quantity: int | None = Field(default=None, ge=0)
     low_stock_threshold: int = Field(default=0, ge=0)
     is_available: bool = True
+
+
+class RiderInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    phone_number: str = Field(min_length=7, max_length=32)
+    is_active: bool = False
+
+
+class DeliveryAreaInput(BaseModel):
+    name: str = Field(min_length=1, max_length=24)
+    fee: Decimal = Field(ge=0)
+    expected_minutes: int = Field(gt=0, le=1440)
+    sort_order: int = Field(ge=0, le=10000)
+    is_active: bool = True
 
 
 @router.get("/dashboard", include_in_schema=False)
@@ -82,6 +99,106 @@ async def reject_order(batch_id: int) -> dict:
     return await _set_batch_status(batch_id, OrderStatus.CANCELLED)
 
 
+@router.get("/api/riders")
+async def list_riders() -> list[dict]:
+    async with async_session_factory() as session:
+        result = await session.execute(select(Rider).where(~Rider.is_archived).order_by(Rider.name))
+        return [_rider(rider) for rider in result.scalars()]
+
+
+@router.post("/api/riders")
+async def create_rider(payload: RiderInput) -> dict:
+    try:
+        phone = normalize_phone(payload.phone_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    async with async_session_factory() as session:
+        rider = Rider(name=payload.name.strip(), phone_number=phone, is_active=payload.is_active)
+        session.add(rider)
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="A rider with that phone number already exists.") from exc
+        await session.refresh(rider)
+        return _rider(rider)
+
+
+@router.patch("/api/riders/{rider_id}")
+async def update_rider(rider_id: int, payload: RiderInput) -> dict:
+    try:
+        phone = normalize_phone(payload.phone_number)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    async with async_session_factory() as session:
+        rider = await session.get(Rider, rider_id)
+        if rider is None or rider.is_archived:
+            raise HTTPException(status_code=404, detail="Rider not found")
+        rider.name = payload.name.strip()
+        rider.phone_number = phone
+        rider.is_active = payload.is_active
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="A rider with that phone number already exists.") from exc
+        await session.refresh(rider)
+        return _rider(rider)
+
+
+@router.post("/api/riders/{rider_id}/archive")
+async def archive_rider(rider_id: int) -> dict:
+    async with async_session_factory() as session:
+        rider = await session.get(Rider, rider_id)
+        if rider is None:
+            raise HTTPException(status_code=404, detail="Rider not found")
+        rider.is_archived = True
+        rider.is_active = False
+        await session.commit()
+        return {"status": "archived", "id": rider.id}
+
+
+@router.get("/api/delivery-areas")
+async def list_delivery_areas() -> list[dict]:
+    async with async_session_factory() as session:
+        result = await session.execute(select(DeliveryArea).order_by(DeliveryArea.sort_order, DeliveryArea.name))
+        return [_area(area) for area in result.scalars()]
+
+
+@router.post("/api/delivery-areas")
+async def create_delivery_area(payload: DeliveryAreaInput) -> dict:
+    async with async_session_factory() as session:
+        values = payload.model_dump()
+        values["name"] = payload.name.strip()
+        area = DeliveryArea(**values)
+        session.add(area)
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="A delivery area with that name already exists.") from exc
+        await session.refresh(area)
+        return _area(area)
+
+
+@router.patch("/api/delivery-areas/{area_id}")
+async def update_delivery_area(area_id: int, payload: DeliveryAreaInput) -> dict:
+    async with async_session_factory() as session:
+        area = await session.get(DeliveryArea, area_id)
+        if area is None:
+            raise HTTPException(status_code=404, detail="Delivery area not found")
+        for key, value in payload.model_dump().items():
+            setattr(area, key, value)
+        area.name = area.name.strip()
+        try:
+            await session.commit()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=409, detail="A delivery area with that name already exists.") from exc
+        await session.refresh(area)
+        return _area(area)
+
+
 async def _set_batch_status(batch_id: int, status: OrderStatus) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -140,4 +257,35 @@ def _batch(batch) -> dict:
             }
             for order in batch.orders
         ],
+    }
+
+
+def _rider(rider: Rider) -> dict:
+    last_message_at = rider.last_message_at
+    if last_message_at and last_message_at.tzinfo is None:
+        last_message_at = last_message_at.replace(tzinfo=timezone.utc)
+    available = bool(
+        rider.is_active
+        and last_message_at
+        and last_message_at >= datetime.now(timezone.utc) - timedelta(hours=24)
+    )
+    return {
+        "id": rider.id,
+        "name": rider.name,
+        "phone_number": rider.phone_number,
+        "is_active": rider.is_active,
+        "is_archived": rider.is_archived,
+        "last_message_at": rider.last_message_at.isoformat() if rider.last_message_at else None,
+        "available": available,
+    }
+
+
+def _area(area: DeliveryArea) -> dict:
+    return {
+        "id": area.id,
+        "name": area.name,
+        "fee": str(area.fee),
+        "expected_minutes": area.expected_minutes,
+        "is_active": area.is_active,
+        "sort_order": area.sort_order,
     }
