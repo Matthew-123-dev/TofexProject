@@ -18,7 +18,6 @@ app/
   api/                     webhook_whatsapp, dashboard, health, dev
   services/                state_machine, menu_service (stock logic), order_service, whatsapp
 alembic/                   Migrations
-scripts/simulate.py        Terminal chat for testing (customer + admin)
 ```
 
 ## Staff-managed stock
@@ -43,5 +42,28 @@ contains the shared receipt, payment status, and one delivery fee.
 
 The dashboard supports editing prices, descriptions, categories, stock, and availability, plus adding menu items and approving or rejecting payment batches.
 
+## Test locally without webhooks
+
+You can test the app locally without configuring any Meta callback:
+
+1. Set `DRY_RUN=true` in `.env`.
+2. Use the local SQLite database (`DATABASE_URL=sqlite+aiosqlite:///./foodbot.db`).
+3. Start the app with `uvicorn app.main:app --reload`.
+4. Open `http://127.0.0.1:8000/dashboard` to manage the menu and orders.
+5. Read the messages the bot would have sent from `GET /dev/outbox`.
+
+In dry-run mode, outbound WhatsApp calls are printed to the terminal and stored in
+the in-memory outbox. No webhook registration is needed for this workflow.
+
+To simulate customer messages from a terminal, start the API and run:
+
+```bash
+uvicorn app.main:app --reload
+python scripts/simulate.py
+```
+
+Type `menu`, then type the reply IDs printed by the bot, such as `cat:Food` or
+`add:1`. Use `:image` to simulate a receipt upload, and `:help` for all commands.
+
 ## Not done yet
-Delivery address capture, menu pagination over 10 items, cart editing, customer-side order cancellation, dashboard authentication, automated tests, and receipt-image preview.
+Delivery address capture, cart editing, customer-side order cancellation, dashboard authentication, automated tests, and receipt-image preview.

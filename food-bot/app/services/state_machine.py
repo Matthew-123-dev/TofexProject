@@ -12,6 +12,8 @@ from app.utils import naira
 logger = logging.getLogger(__name__)
 
 GREETINGS = {"menu", "hi", "hello", "hey", "start"}
+MENU_PAGE_SIZE = 10
+QUANTITY_PAGE_SIZE = 10
 
 
 async def get_or_create_user(session: AsyncSession, phone: str) -> User:
@@ -49,10 +51,30 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     if text in GREETINGS or rid == "menu":
         return await handle_menu_request(session, user)
+    if rid.startswith("catpg:"):
+        category_page = rid.removeprefix("catpg:")
+        if ":" not in category_page:
+            await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
+            return
+        category, page_text = category_page.rsplit(":", 1)
+        if not page_text.isdigit():
+            await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
+            return
+        return await handle_category_selected(session, user, category, int(page_text))
     if rid.startswith("cat:"):
         return await handle_category_selected(session, user, rid.removeprefix("cat:"))
     if rid.startswith("add:"):
-        return await handle_add_item(session, user, int(rid.removeprefix("add:")))
+        item_id_text = rid.removeprefix("add:")
+        if not item_id_text.isdigit():
+            await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
+            return
+        return await show_quantity_selection(session, user, int(item_id_text))
+    if rid.startswith("qty:"):
+        quantity_parts = rid.removeprefix("qty:").split(":")
+        if len(quantity_parts) != 2 or not all(part.isdigit() for part in quantity_parts):
+            await whatsapp.send_text(user.phone_number, "That quantity is invalid. Send *menu* to start again.")
+            return
+        return await handle_add_item(session, user, int(quantity_parts[0]), int(quantity_parts[1]))
     if rid == "carts":
         return await show_carts(session, user)
     if rid == "newcart":
@@ -79,41 +101,106 @@ async def handle_menu_request(session: AsyncSession, user: User) -> None:
     await whatsapp.send_list(user.phone_number, "What would you like to order?", "View menu", "Categories", rows)
 
 
-async def handle_category_selected(session: AsyncSession, user: User, category: str) -> None:
+async def handle_category_selected(
+    session: AsyncSession, user: User, category: str, page: int = 0
+) -> None:
     user.current_state = SessionState.ADDING_TO_CART
     items = await menu_service.get_available_items(session, category)
     if not items:
         await whatsapp.send_text(user.phone_number, f"Nothing in {category} is available right now.")
         return
+    total_pages = (len(items) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE
+    page = min(max(page, 0), total_pages - 1)
+    start = page * MENU_PAGE_SIZE
+    end = start + MENU_PAGE_SIZE
     rows = [
         {"id": f"add:{i.id}", "title": i.name[:24], "description": naira(i.price)}
-        for i in items  # TODO: paginate when a category has more than 10 items
+        for i in items[start:end]
     ]
-    await whatsapp.send_list(user.phone_number, f"*{category}*: tap an item to add it", "Choose item", category, rows)
+    heading = f"*{category}*: tap an item to add it"
+    if total_pages > 1:
+        heading = f"{heading}\nPage {page + 1}/{total_pages}"
+    await whatsapp.send_list(user.phone_number, heading, "Choose item", category, rows)
+    if total_pages > 1:
+        buttons: list[tuple[str, str]] = []
+        if page > 0:
+            buttons.append((f"catpg:{category}:{page - 1}", "Previous"))
+        buttons.append(("menu", "Categories"))
+        if page < total_pages - 1:
+            buttons.append((f"catpg:{category}:{page + 1}", "Next"))
+        await whatsapp.send_buttons(
+            user.phone_number,
+            f"Browsing {category}: page {page + 1} of {total_pages}.",
+            buttons,
+        )
 
 
-async def handle_add_item(session: AsyncSession, user: User, item_id: int) -> None:
+async def show_quantity_selection(session: AsyncSession, user: User, item_id: int) -> None:
+    item: MenuItem | None = await menu_service.get_item(session, item_id)
+    if item is None or not item.is_available:
+        await whatsapp.send_text(
+            user.phone_number,
+            "Sorry, that item is no longer available. Send *menu* to pick something else.",
+        )
+        return
+    available_quantity = item.sellable_units
+    if available_quantity is not None:
+        in_cart = 0
+        if user.active_cart_id is not None:
+            cart = await session.get(Cart, user.active_cart_id)
+            if cart is not None and cart.user_id == user.id:
+                lines = await order_service.get_cart(session, cart.id)
+                in_cart = next((c.quantity for c, m in lines if m.id == item_id), 0)
+        available_quantity = max(0, available_quantity - in_cart)
+    max_quantity = QUANTITY_PAGE_SIZE if available_quantity is None else min(
+        QUANTITY_PAGE_SIZE, available_quantity
+    )
+    if max_quantity < 1:
+        await whatsapp.send_text(user.phone_number, f"Sorry, {item.name} is sold out.")
+        return
+    rows = [
+        {
+            "id": f"qty:{item.id}:{quantity}",
+            "title": f"{quantity} portion{'s' if quantity != 1 else ''}",
+        }
+        for quantity in range(1, max_quantity + 1)
+    ]
+    await whatsapp.send_list(
+        user.phone_number,
+        f"How many portions of *{item.name}* would you like?",
+        "Choose quantity",
+        item.name,
+        rows,
+    )
+
+
+async def handle_add_item(
+    session: AsyncSession, user: User, item_id: int, quantity: int
+) -> None:
     item: MenuItem | None = await menu_service.get_item(session, item_id)
     if item is None or not item.is_available:  # re-check: stock may have changed since the list was sent
         await whatsapp.send_text(user.phone_number, "Sorry, that item just ran out. Send *menu* to pick something else.")
+        return
+    if quantity < 1 or quantity > QUANTITY_PAGE_SIZE:
+        await whatsapp.send_text(user.phone_number, "Please choose a quantity from the list.")
         return
     cart = await order_service.get_or_create_cart(session, user.id)
     lines = await order_service.get_cart(session, cart.id)
     in_cart = next((c.quantity for c, m in lines if m.id == item_id), 0)
     limit = item.sellable_units  # None when stock isn't tracked
-    if limit is not None and in_cart + 1 > limit:
+    if limit is not None and in_cart + quantity > limit:
         await whatsapp.send_buttons(
             user.phone_number,
             f"Sorry, only {limit} {item.name} available and you already have {in_cart} in your cart.",
             [("menu", "Browse menu"), ("checkout", "Checkout")],
         )
         return
-    await order_service.add_to_cart(session, user.id, item_id, cart_id=cart.id)
+    await order_service.add_to_cart(session, user.id, item_id, quantity=quantity, cart_id=cart.id)
     lines = await order_service.get_cart(session, cart.id)
     subtotal = order_service.cart_subtotal(lines)
     await whatsapp.send_buttons(
         user.phone_number,
-        f"Added {item.name}. Cart: {sum(c.quantity for c, _ in lines)} item(s), {naira(subtotal)}.",
+        f"Added {quantity} x {item.name}. Cart: {sum(c.quantity for c, _ in lines)} item(s), {naira(subtotal)}.",
         [("menu", "Add more"), ("newcart", "New cart"), ("carts", "Choose carts")],
     )
 

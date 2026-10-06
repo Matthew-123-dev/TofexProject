@@ -14,6 +14,11 @@ cp .env.example .env
 Set `DRY_RUN=true` while testing locally, then add the WhatsApp and bank settings
 when you are ready to connect the real client.
 
+With `DRY_RUN=true`, the app does not send real WhatsApp messages. Instead, it
+prints outgoing messages to the terminal and exposes them at `GET /dev/outbox`.
+That means you can test the dashboard and order flow locally without registering
+any webhook callback.
+
 For a new development database:
 
 ```bash
@@ -61,6 +66,20 @@ POST /webhook/whatsapp
 Configure this callback in Meta WhatsApp Cloud API and subscribe to the
 `messages` field. The dashboard is a normal web page and does not require a
 separate webhook.
+
+If you only want to test locally, you can skip the webhook entirely and rely on
+dry-run mode plus the dashboard.
+
+For an interactive terminal simulation, start the app and run this in a second
+terminal:
+
+```bash
+python scripts/simulate.py
+```
+
+The simulator sends signed requests to the local endpoint, displays dry-run
+responses, and accepts the reply IDs shown in those responses. It supports
+`:help`, `:outbox`, `:image`, and `:quit`.
 
 ## Current development limitations
 
