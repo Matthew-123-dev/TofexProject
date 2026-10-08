@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import async_session_factory
 from app.messages import M13_REMINDER, M14_CANCELLED, M18_DELIVERED, M19_NOT_RECEIVED, R4_PICKUP_REMINDER, R7_WINDOW_WARNING
-from app.models import Fulfillment, FulfillmentStage, OrderStatus, PaymentBatch, Rider, SessionState, User
+from app.models import Fulfillment, FulfillmentStage, Order, OrderStatus, PaymentBatch, Rider, SessionState, User
 from app.services import whatsapp
 
 logger = logging.getLogger(__name__)
@@ -102,7 +102,12 @@ async def run_once() -> None:
                     fulfillment.stage = FulfillmentStage.CANCELLED
                     fulfillment.cancelled_at = now
                     batch.status = OrderStatus.CANCELLED
-                    for order in batch.orders:
+                    orders = (
+                        await session.execute(
+                            select(Order).where(Order.payment_batch_id == batch.id)
+                        )
+                    ).scalars()
+                    for order in orders:
                         order.status = OrderStatus.CANCELLED
                     _mark_reminder(fulfillment, cancel_key)
                     continue

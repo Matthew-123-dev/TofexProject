@@ -49,6 +49,7 @@ async def get_rider_by_phone(session: AsyncSession, phone: str) -> Rider | None:
 
 async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     """Route one customer message based on what they sent and their current state."""
+    print("INCOMING", msg.type, repr(msg.reply_id), repr(msg.text), flush=True)
     rider = await get_rider_by_phone(session, msg.sender)
     if rider is not None:
         rider.last_message_at = datetime.now(timezone.utc)

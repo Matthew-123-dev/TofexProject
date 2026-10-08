@@ -146,6 +146,7 @@ def _batch_query():
     return select(PaymentBatch).options(
         selectinload(PaymentBatch.orders).selectinload(Order.items).selectinload(OrderItem.item),
         selectinload(PaymentBatch.orders).selectinload(Order.user),
+        selectinload(PaymentBatch.fulfillment).selectinload(Fulfillment.rider),
     )
 
 

@@ -9,7 +9,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.database import Base
+from app.database import Base, UTCDateTime
 
 
 class SessionState(str, enum.Enum):
@@ -58,7 +58,7 @@ class User(Base):
     current_state: Mapped[SessionState] = mapped_column(
         Enum(SessionState, native_enum=False, length=32), default=SessionState.BROWSING
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
     saved_address: Mapped["SavedAddress | None"] = relationship(back_populates="user", uselist=False)
 
 
@@ -69,7 +69,7 @@ class Cart(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(120))
     is_selected: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
     items: Mapped[list[CartItem]] = relationship(back_populates="cart", cascade="all, delete-orphan")
 
@@ -88,7 +88,7 @@ class MenuItem(Base):
     stock_quantity: Mapped[int | None] = mapped_column(Integer)
     # Once stock_quantity <= low_stock_threshold the item is hidden and staff are alerted.
     low_stock_threshold: Mapped[int] = mapped_column(Integer, default=0)
-    availability_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_updated_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     @property
     def sellable_units(self) -> int | None:
@@ -122,7 +122,7 @@ class PaymentBatch(Base):
         Enum(OrderStatus, native_enum=False, length=16, values_callable=lambda e: [m.value for m in e]),
         default=OrderStatus.PENDING,
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
     orders: Mapped[list[Order]] = relationship(back_populates="payment_batch", cascade="all, delete-orphan")
     fulfillment: Mapped["Fulfillment | None"] = relationship(
@@ -144,7 +144,7 @@ class Order(Base):
         default=OrderStatus.PENDING,
     )
     delivery_address: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
     user: Mapped[User] = relationship()
     payment_batch: Mapped[PaymentBatch] = relationship(back_populates="orders")
@@ -172,7 +172,7 @@ class ProcessedMessage(Base):
     __tablename__ = "processed_messages"
 
     message_id: Mapped[str] = mapped_column(String(200), primary_key=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
 
 class DeliveryArea(Base):
@@ -184,7 +184,7 @@ class DeliveryArea(Base):
     expected_minutes: Mapped[int] = mapped_column(Integer)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
 
 class Rider(Base):
@@ -195,10 +195,10 @@ class Rider(Base):
     phone_number: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
-    last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    window_warning_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_message_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    window_warning_sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     pending_action: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
 
 class SavedAddress(Base):
@@ -214,7 +214,7 @@ class SavedAddress(Base):
     notes: Mapped[str | None] = mapped_column(String(200))
     latitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
     longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now(), onupdate=func.now())
 
     user: Mapped[User] = relationship(back_populates="saved_address")
     area: Mapped["DeliveryArea | None"] = relationship()
@@ -248,28 +248,28 @@ class Fulfillment(Base):
     longitude: Mapped[Decimal | None] = mapped_column(Numeric(10, 7))
     expected_minutes: Mapped[int | None] = mapped_column(Integer)
     rider_id: Mapped[int | None] = mapped_column(ForeignKey("riders.id", ondelete="SET NULL"))
-    timer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    timer_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     reminders_sent: Mapped[str] = mapped_column(Text, default="[]")
     address_editing: Mapped[bool] = mapped_column(Boolean, default=False)
-    address_edit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    address_edit_started_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     dispatch_error: Mapped[str | None] = mapped_column(Text)
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    picked_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    collected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    thank_you_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    thank_you_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    rider_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    ready_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    dispatched_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    picked_up_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    collected_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    failed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    cancelled_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    thank_you_due_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    thank_you_sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    rider_reminder_sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     failure_reasons: Mapped[str | None] = mapped_column(Text)
     failure_note: Mapped[str | None] = mapped_column(Text)
     failed_by: Mapped[str | None] = mapped_column(String(16))
-    not_received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    failed_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    not_received_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    not_received_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    failed_acknowledged_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    not_received_acknowledged_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
 
     payment_batch: Mapped[PaymentBatch] = relationship(back_populates="fulfillment")
     area: Mapped["DeliveryArea | None"] = relationship()

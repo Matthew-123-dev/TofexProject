@@ -199,11 +199,15 @@ async def run(base_url: str, phone: str, secret: str) -> None:
                 )
             elif value.startswith(":"):
                 print("Unknown command. Type :help for available commands.")
-            elif value.startswith(("cat:", "catpg:", "add:", "qty:", "cart:")) or value in {
+            elif value.startswith((
+                "cat:", "catpg:", "add:", "qty:", "cart:", "fulfillment:",
+                "areas:", "area:", "address:", "quote:",
+            )) or value in {
                 "menu",
                 "carts",
                 "newcart",
                 "checkout",
+                "cancel",
             }:
                 await _send(
                     client,
