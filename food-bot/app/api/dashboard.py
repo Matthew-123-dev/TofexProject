@@ -3,15 +3,25 @@ from decimal import Decimal
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import async_session_factory
 from app.messages import M8C_QUOTE, M19_NOT_RECEIVED, M20_FAILED
-from app.models import DeliveryArea, Fulfillment, FulfillmentStage, MenuItem, OrderStatus, PaymentBatch, Rider, SessionState
+from app.models import (
+    CartItem,
+    DeliveryArea,
+    Fulfillment,
+    FulfillmentStage,
+    MenuItem,
+    OrderStatus,
+    PaymentBatch,
+    Rider,
+    SessionState,
+)
 from app.services import menu_service, order_service, state_machine, whatsapp
 from app.utils import naira, normalize_phone
 
@@ -94,6 +104,19 @@ async def update_menu_item(item_id: int, payload: MenuItemInput) -> dict:
         return _menu_item(item)
 
 
+@router.delete("/api/staff/menu/{item_id}")
+async def delete_menu_item(item_id: int) -> dict:
+    async with async_session_factory() as session:
+        item = await session.get(MenuItem, item_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Menu item not found")
+        # Clear any lingering cart references so in-progress carts don't point at a deleted item.
+        await session.execute(delete(CartItem).where(CartItem.item_id == item_id))
+        await session.delete(item)
+        await session.commit()
+        return {"status": "deleted", "id": item_id}
+
+
 @router.get("/api/staff/orders")
 async def list_orders() -> list[dict]:
     async with async_session_factory() as session:
@@ -104,6 +127,38 @@ async def list_orders() -> list[dict]:
             if batch:
                 batches.append(_batch(batch))
         return batches
+
+
+@router.get("/api/staff/orders/{batch_id}/receipt")
+async def get_receipt(batch_id: int) -> Response:
+    async with async_session_factory() as session:
+        batch = await order_service.get_batch(session, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="Payment batch not found")
+        if not batch.receipt_media_id:
+            raise HTTPException(status_code=404, detail="No receipt has been uploaded for this order")
+        media_id = batch.receipt_media_id
+    if settings.dry_run:
+        raise HTTPException(
+            status_code=409,
+            detail="Receipt previews aren't available in dry-run mode (no real image was uploaded).",
+        )
+    content, mime_type = await whatsapp.download_media(media_id)
+    if not content:
+        raise HTTPException(status_code=502, detail="Could not fetch the receipt image from WhatsApp.")
+    return Response(content=content, media_type=mime_type)
+
+
+@router.delete("/api/staff/orders/{batch_id}")
+async def delete_order(batch_id: int) -> dict:
+    async with async_session_factory() as session:
+        batch = await order_service.get_batch(session, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="Payment batch not found")
+        # Cascades to the batch's orders, order items, and fulfillment record.
+        await session.delete(batch)
+        await session.commit()
+        return {"status": "deleted", "id": batch_id}
 
 
 @router.post("/api/staff/orders/{batch_id}/approve")
@@ -122,13 +177,13 @@ class QuoteInput(BaseModel):
 
 @router.post("/api/staff/orders/{batch_id}/quote")
 async def quote_order(batch_id: int, payload: QuoteInput) -> dict:
-    """Staff submits a delivery fee quote for a custom ("Other") area, notifying the customer."""
+    """Staff submits (or edits) a delivery fee quote for a custom ("Other") area, (re)notifying the customer."""
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
         if batch is None:
             raise HTTPException(status_code=404, detail="Payment batch not found")
         fulfillment = batch.fulfillment
-        if fulfillment is None or fulfillment.stage != FulfillmentStage.AWAITING_FEE_QUOTE:
+        if fulfillment is None or fulfillment.stage not in {FulfillmentStage.AWAITING_FEE_QUOTE, FulfillmentStage.AWAITING_FEE_ACCEPT}:
             raise HTTPException(status_code=409, detail="Order is not awaiting a fee quote")
         if not batch.orders:
             raise HTTPException(status_code=404, detail="Payment batch has no orders")
@@ -270,6 +325,13 @@ async def list_riders() -> list[dict]:
         return [_rider(rider) for rider in result.scalars()]
 
 
+@router.get("/api/staff/riders/archived")
+async def list_archived_riders() -> list[dict]:
+    async with async_session_factory() as session:
+        result = await session.execute(select(Rider).where(Rider.is_archived).order_by(Rider.name))
+        return [_rider(rider) for rider in result.scalars()]
+
+
 @router.post("/api/staff/riders")
 async def create_rider(payload: RiderInput) -> dict:
     try:
@@ -320,6 +382,32 @@ async def archive_rider(rider_id: int) -> dict:
         rider.is_active = False
         await session.commit()
         return {"status": "archived", "id": rider.id}
+
+
+@router.post("/api/staff/riders/{rider_id}/unarchive")
+async def unarchive_rider(rider_id: int) -> dict:
+    async with async_session_factory() as session:
+        rider = await session.get(Rider, rider_id)
+        if rider is None:
+            raise HTTPException(status_code=404, detail="Rider not found")
+        rider.is_archived = False
+        await session.commit()
+        return {"status": "unarchived", "id": rider.id}
+
+
+@router.delete("/api/staff/riders/{rider_id}")
+async def delete_rider(rider_id: int) -> dict:
+    async with async_session_factory() as session:
+        rider = await session.get(Rider, rider_id)
+        if rider is None:
+            raise HTTPException(status_code=404, detail="Rider not found")
+        # Detach the rider from any fulfillments referencing them before deleting.
+        await session.execute(
+            update(Fulfillment).where(Fulfillment.rider_id == rider_id).values(rider_id=None)
+        )
+        await session.delete(rider)
+        await session.commit()
+        return {"status": "deleted", "id": rider_id}
 
 
 @router.get("/api/staff/delivery-areas")

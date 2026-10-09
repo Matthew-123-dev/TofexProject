@@ -635,21 +635,12 @@ async def process_address_step(
                 await send_payment_message(user, batch, fulfillment)
         elif msg.reply_id == "fulfillment:delivery":
             fulfillment.fulfillment_type = "delivery"
-            fulfillment.checkout_step = "street"
-            await whatsapp.send_text(user.phone_number, M2_STREET)
+            fulfillment.checkout_step = "area"
+            await send_area_page(session, user, fulfillment, 0)
         else:
             await whatsapp.send_buttons(user.phone_number, M1_CHOICE, [
                 ("fulfillment:delivery", "Delivery"), ("fulfillment:pickup", "Pickup"), ("cancel", "Cancel order")
             ])
-        return
-
-    if step == "street":
-        if len(text) < 5 or len(text) > 150:
-            await whatsapp.send_text(user.phone_number, "Please send a street address between 5 and 150 characters, including your house or plot number.")
-            return
-        fulfillment.street = text
-        fulfillment.checkout_step = "area"
-        await send_area_page(session, user, fulfillment, 0)
         return
 
     if step == "area":
@@ -671,8 +662,8 @@ async def process_address_step(
             fulfillment.area_name = area.name
             fulfillment.expected_minutes = area.expected_minutes
             fulfillment._quoted_fee = area.fee
-            fulfillment.checkout_step = "pin"
-            await ask_pin(session, user)
+            fulfillment.checkout_step = "street"
+            await whatsapp.send_text(user.phone_number, M2_STREET)
             return
         await send_area_page(session, user, fulfillment, 0)
         return
@@ -683,6 +674,15 @@ async def process_address_step(
             return
         fulfillment.area_id = None
         fulfillment.area_name = text
+        fulfillment.checkout_step = "street"
+        await whatsapp.send_text(user.phone_number, M2_STREET)
+        return
+
+    if step == "street":
+        if len(text) < 5 or len(text) > 150:
+            await whatsapp.send_text(user.phone_number, "Please send a street address between 5 and 150 characters, including your house or plot number.")
+            return
+        fulfillment.street = text
         fulfillment.checkout_step = "pin"
         await ask_pin(session, user)
         return

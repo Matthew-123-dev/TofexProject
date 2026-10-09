@@ -92,16 +92,22 @@ async def send_location_request(to: str, body: str) -> bool:
     })
 
 
-async def download_media(media_id: str) -> bytes:
-    """Two-step fetch: media id -> temporary URL -> bytes (both need the access token)."""
+async def download_media(media_id: str) -> tuple[bytes, str]:
+    """Two-step fetch: media id -> temporary URL -> bytes (both need the access token).
+
+    Returns (content, mime_type). In dry-run mode there is no real WhatsApp
+    media to fetch, so this returns an empty payload the caller should treat
+    as "no preview available".
+    """
     if settings.dry_run:
-        return b"dry-run-image"
+        return b"", "application/octet-stream"
     async with httpx.AsyncClient(timeout=30) as client:
         meta = await client.get(f"{GRAPH}/{settings.whatsapp_api_version}/{media_id}", headers=_headers())
         meta.raise_for_status()
-        file = await client.get(meta.json()["url"], headers=_headers())
+        meta_json = meta.json()
+        file = await client.get(meta_json["url"], headers=_headers())
         file.raise_for_status()
-        return file.content
+        return file.content, meta_json.get("mime_type", "application/octet-stream")
 
 
 def parse_incoming(payload: dict) -> list[IncomingMessage]:

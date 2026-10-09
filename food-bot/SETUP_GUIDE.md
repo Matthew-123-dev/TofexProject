@@ -61,7 +61,10 @@ ordering flow:
 - `BRAND_NAME`, `OUTLET_ADDRESS`, `OUTLET_PHONE`, and `SUPPORT_PHONE`.
 - `BANK_NAME`, `BANK_ACCOUNT_NUMBER`, and `BANK_ACCOUNT_NAME` for payment
   instructions.
-- `DELIVERY_FEE` and the checkout/reminder timing settings.
+- The checkout/reminder timing settings. Delivery fees themselves are no
+  longer taken from `DELIVERY_FEE`; each delivery area has its own fee set on
+  the Delivery areas page, and custom ("Other") areas get a one-off fee that
+  staff enter on the Orders page.
 
 `STAFF_USERNAME`, `STAFF_PASSWORD`, and `SESSION_SECRET` protect the staff
 console. Keep them private and use strong, unique values in production.
@@ -118,7 +121,50 @@ The application is available at `http://127.0.0.1:8000`. Useful endpoints are:
 - WhatsApp webhook: `POST /webhook/whatsapp`
 
 The dashboard provides previews and links to separate pages for menu, orders,
-riders, and delivery areas. Management APIs require the staff session.
+riders, and delivery areas. All of `/dashboard`, `/manage-menu`, `/orders`,
+`/riders`, and `/delivery-areas` require a staff session; visiting them while
+logged out redirects to `/login`. Management APIs require the same session.
+
+Log in with the `STAFF_USERNAME` and `STAFF_PASSWORD` values from `.env`.
+These credentials are not stored in the database, so changing them only
+requires editing `.env` and restarting the app. Use `POST /logout` (the
+"Sign out" button in the dashboard) to end the session.
+
+If `uvicorn app.main:app --reload` fails with
+`ModuleNotFoundError: No module named 'app'`, Python cannot find the `app`
+package. Make sure your terminal's working directory is `food-bot` (the
+folder containing `app/`) and that the virtual environment you created
+earlier is activated, then re-run the command from there.
+
+## Staff dashboard features
+
+- **Overview (`/dashboard`)** — summary stats (menu item count, items
+  available now, pending orders, last sync time), a menu snapshot (up to
+  three items per category, with a "More" link to the full catalogue), the
+  five most recent active orders, up to five riders, and up to five delivery
+  areas. Each section links to its full page.
+- **Manage menu (`/manage-menu`)** — add, edit, and delete menu items
+  (name, description, category, price, stock quantity, low-stock threshold,
+  availability). Deleting an item removes it permanently; past orders keep
+  showing the item's name and price because order history stores its own
+  copy of that information.
+- **Orders (`/orders`)** — view every order, with active orders ranked above
+  completed/cancelled ones. Approve or reject submitted payment receipts,
+  dispatch or reassign a rider, mark orders ready/collected, mark a failed
+  delivery, and delete an order permanently. When a customer selects "Other"
+  for their delivery area and types a custom location, the order shows an
+  "awaiting fee quote" status here — use **Send quote** to set a delivery fee
+  and notify the customer over WhatsApp. Before the customer accepts, you can
+  use **Edit quote** to resend an updated fee.
+- **Riders (`/riders`)** — add riders and list up to five on the Overview
+  page, or manage the full roster here: edit a rider's details, archive a
+  rider (removes them from dispatch options without deleting their history),
+  unarchive a previously archived rider, or permanently delete a rider.
+  Archived riders are listed in their own section on this page.
+- **Delivery areas (`/delivery-areas`)** — add, edit, enable/disable, and
+  reorder delivery areas, each with its own fee and expected delivery time.
+  Disabling an area hides it from the WhatsApp delivery-area list without
+  deleting it.
 
 ## Run the terminal simulation (optional)
 
@@ -156,6 +202,13 @@ The simulator also accepts normal text such as `carts`, `newcart`, and
 If it reports that it cannot connect, confirm that Uvicorn is still running
 and that its URL matches `--base-url`.
 
+During checkout for a delivery order, the bot asks for the delivery area
+first, before the street address, landmark, and other details. Choosing a
+listed area applies its preset fee immediately. Choosing "Other" and typing a
+custom area name instead pauses the order in an "awaiting fee quote" state —
+log in to the dashboard's Orders page and use **Send quote** to set a fee and
+let the customer continue.
+
 ## Connect a real WhatsApp webhook (optional)
 
 Only do this after local dry-run testing. Set `DRY_RUN=false` and provide the
@@ -182,7 +235,9 @@ Uvicorn server or SQLite file as a public production deployment.
 
 ## Known limitations
 
-- Delivery address capture is not implemented.
 - Menu lists are limited to the WhatsApp list-message limit.
 - Receipt images are stored by WhatsApp media ID but are not previewed in the
   dashboard.
+- A custom ("Other") delivery area always requires a staff-sent fee quote
+  before checkout can proceed; there is no automatic fee estimate for areas
+  outside the configured list.
