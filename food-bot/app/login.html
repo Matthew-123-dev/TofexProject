@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Tofex</title>
+  <style>
+    :root { color-scheme: dark; --ink:#f7f3ed; --muted:#b9b0a5; --accent:#ef8064; --panel:#252322; }
+    * { box-sizing:border-box; } body { margin:0; min-height:100vh; display:grid; place-items:center; color:var(--ink); background:radial-gradient(circle at 15% 10%,#74382e 0,#211d1d 42%,#111 100%); font:15px system-ui,sans-serif; }
+    .card { width:min(420px,calc(100% - 32px)); padding:40px; border:1px solid #ffffff1c; border-radius:24px; background:#1b1918e8; box-shadow:0 24px 80px #0008; backdrop-filter:blur(16px); }
+    .brand { color:var(--accent); font-weight:800; letter-spacing:.14em; text-transform:uppercase; } h1 { margin:32px 0 8px; font:700 32px Georgia,serif; } p { color:var(--muted); line-height:1.6; } label { display:grid; gap:7px; margin:20px 0; color:var(--muted); font-weight:650; } input { padding:13px 14px; border:1px solid #ffffff24; border-radius:10px; color:var(--ink); background:#ffffff0c; font:inherit; } button { width:100%; margin-top:8px; padding:13px; border:0; border-radius:10px; color:#231716; background:var(--accent); cursor:pointer; font:700 15px inherit; } .error { padding:11px 13px; border-radius:10px; color:#ffd3ca; background:#9b382c66; }
+  </style>
+</head>
+<body><main class="card"><div class="brand">Tofex · operations</div><h1>Welcome back</h1><p>Sign in to manage your menu, orders, riders, and delivery areas.</p><div id="error" class="error" hidden></div><form method="post" action="/login"><label>Username<input name="username" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></main><script>const e=new URLSearchParams(location.search).get('error');if(e){const n=document.querySelector('#error');n.hidden=false;n.textContent=e==='not-configured'?'Staff login is not configured yet.':'Those credentials are not recognised.';}</script></body>
+</html>

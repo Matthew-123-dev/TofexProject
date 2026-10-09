@@ -46,6 +46,9 @@ Before starting the app, set at least:
 APP_ENV=development
 DATABASE_URL=sqlite+aiosqlite:///./foodbot.db
 DRY_RUN=true
+STAFF_USERNAME=admin
+STAFF_PASSWORD=choose-a-strong-password
+SESSION_SECRET=generate-a-long-random-secret
 ```
 
 `DRY_RUN=true` prevents real WhatsApp API calls, prints outgoing messages to
@@ -59,6 +62,9 @@ ordering flow:
 - `BANK_NAME`, `BANK_ACCOUNT_NUMBER`, and `BANK_ACCOUNT_NAME` for payment
   instructions.
 - `DELIVERY_FEE` and the checkout/reminder timing settings.
+
+`STAFF_USERNAME`, `STAFF_PASSWORD`, and `SESSION_SECRET` protect the staff
+console. Keep them private and use strong, unique values in production.
 
 Do not commit `.env`; it can contain access tokens and other deployment
 secrets.
@@ -104,15 +110,15 @@ uvicorn app.main:app --reload
 
 The application is available at `http://127.0.0.1:8000`. Useful endpoints are:
 
+- Staff login: `http://127.0.0.1:8000/login`
 - Staff dashboard: `http://127.0.0.1:8000/dashboard`
+- Staff pages: `/manage-menu`, `/orders`, `/riders`, and `/delivery-areas`
 - Health check: `http://127.0.0.1:8000/health`
 - Dry-run outbox: `http://127.0.0.1:8000/dev/outbox` (only when `DRY_RUN=true`)
 - WhatsApp webhook: `POST /webhook/whatsapp`
 
-The dashboard can edit menu prices, descriptions, categories, stock, and
-availability; add menu items; review and approve or reject payment batches; and
-manage riders and delivery areas. There is currently no staff authentication,
-so do not expose the development server publicly.
+The dashboard provides previews and links to separate pages for menu, orders,
+riders, and delivery areas. Management APIs require the staff session.
 
 ## Run the terminal simulation (optional)
 
@@ -176,7 +182,6 @@ Uvicorn server or SQLite file as a public production deployment.
 
 ## Known limitations
 
-- The dashboard does not yet have staff authentication.
 - Delivery address capture is not implemented.
 - Menu lists are limited to the WhatsApp list-message limit.
 - Receipt images are stored by WhatsApp media ID but are not previewed in the

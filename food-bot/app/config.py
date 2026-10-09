@@ -36,6 +36,9 @@ class Settings(BaseSettings):
 
     # Print outgoing messages instead of sending them, and expose /dev/outbox for the simulator.
     dry_run: bool = False
+    staff_username: str = "admin"
+    staff_password: str = ""
+    session_secret: str = ""
 
     @property
     def async_database_url(self) -> str:

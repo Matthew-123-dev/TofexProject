@@ -10,17 +10,17 @@ M6_SECOND_PHONE = "Is there a second phone number we can reach you on during del
 M7_NOTES = 'Any notes for the rider? (For example, "call when you reach the gate".) Send them now, or tap Skip.'
 M8_SUMMARY = (
     "Please check your delivery details:\n\n📍 {street}, {area}\nLandmark: {landmark}\n"
-    "{second_phone_line}{notes_line}Order: ₦{subtotal}\nDelivery fee: ₦{fee}\nTotal: ₦{total}"
+    "{second_phone_line}{notes_line}Order: {subtotal}\nDelivery fee: {fee}\nTotal: {total}"
 )
 M8B_OTHER_AREA = "Thank you! Your area isn't on our standard list, so our team is confirming your delivery fee. We'll message you shortly."
-M8C_QUOTE = "The delivery fee to {area} is ₦{fee}, so your total is ₦{total}. Would you like to continue?"
+M8C_QUOTE = "The delivery fee to {area} is {fee}, so your total is {total}. Would you like to continue?"
 M9_PAYMENT = (
-    "Thank you, your delivery address is confirmed ✅\n\nTotal to pay: ₦{total}\n\nPlease transfer to:\n"
+    "Thank you, your delivery address is confirmed ✅\n\nTotal to pay: {total}\n\nPlease transfer to:\n"
     "{bank_name}\n{account_number}\n{account_name}\n\nThen send a photo of your transfer receipt here within "
     "{minutes} minutes. To change your address, reply ADDRESS."
 )
 M9_PICKUP = (
-    "Pickup selected. You can collect your order at {outlet_address}.\n\nTotal to pay: ₦{total}\n\n"
+    "Pickup selected. You can collect your order at {outlet_address}.\n\nTotal to pay: {total}\n\n"
     "Please transfer to:\n{bank_name}\n{account_number}\n{account_name}\n\nThen send a photo of your transfer receipt here within {minutes} minutes."
 )
 M10_RECEIPT = "Receipt received. Thank you! 🙏 Our team is confirming your payment. Until we approve it, you can still change your delivery address within the same area by replying ADDRESS."

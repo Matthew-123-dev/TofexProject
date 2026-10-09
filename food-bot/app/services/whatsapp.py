@@ -20,11 +20,14 @@ def _render(payload: dict) -> str:
     inter = payload["interactive"]
     if inter["type"] == "button":
         opts = [f'  [{b["reply"]["id"]}] {b["reply"]["title"]}' for b in inter["action"]["buttons"]]
-    else:
+    elif inter["type"] == "list":
         opts = [
             f'  [{r["id"]}] {r["title"]}' + (f' - {r["description"]}' if r.get("description") else "")
             for sec in inter["action"]["sections"] for r in sec["rows"]
         ]
+    else:
+        # location_request_message and any other action-only interactive types have no selectable rows/buttons.
+        opts = ["  (reply with your location)"] if inter["type"] == "location_request_message" else []
     return inter["body"]["text"] + "\n" + "\n".join(opts)
 
 

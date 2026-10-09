@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -10,12 +10,17 @@ from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import async_session_factory
-from app.messages import M19_NOT_RECEIVED, M20_FAILED
+from app.messages import M8C_QUOTE, M19_NOT_RECEIVED, M20_FAILED
 from app.models import DeliveryArea, Fulfillment, FulfillmentStage, MenuItem, OrderStatus, PaymentBatch, Rider, SessionState
 from app.services import menu_service, order_service, state_machine, whatsapp
-from app.utils import normalize_phone
+from app.utils import naira, normalize_phone
 
-router = APIRouter(tags=["dashboard"])
+async def require_staff(request: Request) -> None:
+    if not request.session.get("staff_authenticated"):
+        raise HTTPException(status_code=401, detail="Staff authentication required")
+
+
+router = APIRouter(tags=["dashboard"], dependencies=[Depends(require_staff)])
 HTML_PATH = Path(__file__).resolve().parents[1] / "dashboard.html"
 
 
@@ -51,19 +56,21 @@ class FailureInput(BaseModel):
     reason: str | None = Field(default=None, max_length=200)
 
 
-@router.get("/dashboard", include_in_schema=False)
-async def dashboard() -> FileResponse:
+@router.get("/{page}", include_in_schema=False)
+async def dashboard(page: str) -> FileResponse:
+    if page not in {"dashboard", "manage-menu", "orders", "riders", "delivery-areas"}:
+        raise HTTPException(status_code=404, detail="Page not found")
     return FileResponse(HTML_PATH)
 
 
-@router.get("/api/menu")
+@router.get("/api/staff/menu")
 async def list_menu() -> list[dict]:
     async with async_session_factory() as session:
         result = await session.execute(select(MenuItem).order_by(MenuItem.category, MenuItem.name))
         return [_menu_item(item) for item in result.scalars()]
 
 
-@router.post("/api/menu")
+@router.post("/api/staff/menu")
 async def create_menu_item(payload: MenuItemInput) -> dict:
     async with async_session_factory() as session:
         item = MenuItem(**payload.model_dump())
@@ -73,7 +80,7 @@ async def create_menu_item(payload: MenuItemInput) -> dict:
         return _menu_item(item)
 
 
-@router.patch("/api/menu/{item_id}")
+@router.patch("/api/staff/menu/{item_id}")
 async def update_menu_item(item_id: int, payload: MenuItemInput) -> dict:
     async with async_session_factory() as session:
         item = await session.get(MenuItem, item_id)
@@ -87,7 +94,7 @@ async def update_menu_item(item_id: int, payload: MenuItemInput) -> dict:
         return _menu_item(item)
 
 
-@router.get("/api/orders")
+@router.get("/api/staff/orders")
 async def list_orders() -> list[dict]:
     async with async_session_factory() as session:
         batches = []
@@ -99,17 +106,47 @@ async def list_orders() -> list[dict]:
         return batches
 
 
-@router.post("/api/orders/{batch_id}/approve")
+@router.post("/api/staff/orders/{batch_id}/approve")
 async def approve_order(batch_id: int) -> dict:
     return await _set_batch_status(batch_id, OrderStatus.PAID)
 
 
-@router.post("/api/orders/{batch_id}/reject")
+@router.post("/api/staff/orders/{batch_id}/reject")
 async def reject_order(batch_id: int) -> dict:
     return await _set_batch_status(batch_id, OrderStatus.CANCELLED)
 
 
-@router.post("/api/orders/{batch_id}/ready")
+class QuoteInput(BaseModel):
+    fee: Decimal = Field(ge=0)
+
+
+@router.post("/api/staff/orders/{batch_id}/quote")
+async def quote_order(batch_id: int, payload: QuoteInput) -> dict:
+    """Staff submits a delivery fee quote for a custom ("Other") area, notifying the customer."""
+    async with async_session_factory() as session:
+        batch = await order_service.get_batch(session, batch_id)
+        if batch is None:
+            raise HTTPException(status_code=404, detail="Payment batch not found")
+        fulfillment = batch.fulfillment
+        if fulfillment is None or fulfillment.stage != FulfillmentStage.AWAITING_FEE_QUOTE:
+            raise HTTPException(status_code=409, detail="Order is not awaiting a fee quote")
+        if not batch.orders:
+            raise HTTPException(status_code=404, detail="Payment batch has no orders")
+        subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
+        batch.delivery_fee = payload.fee
+        batch.total_amount = subtotal + payload.fee
+        fulfillment.stage = FulfillmentStage.AWAITING_FEE_ACCEPT
+        user = batch.orders[0].user
+        if user:
+            user.current_state = SessionState.AWAITING_FEE_ACCEPT
+            await whatsapp.send_buttons(user.phone_number, M8C_QUOTE.format(
+                area=fulfillment.area_name, fee=naira(payload.fee), total=naira(batch.total_amount)
+            ), [("quote:accept", "Proceed to pay"), ("quote:cancel", "Cancel order")])
+        await session.commit()
+        return _batch(await order_service.get_batch(session, batch_id))
+
+
+@router.post("/api/staff/orders/{batch_id}/ready")
 async def mark_order_ready(batch_id: int) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -130,7 +167,7 @@ async def mark_order_ready(batch_id: int) -> dict:
         return {"status": "ready", "batch_id": batch.id}
 
 
-@router.post("/api/orders/{batch_id}/dispatch")
+@router.post("/api/staff/orders/{batch_id}/dispatch")
 async def dispatch_order(batch_id: int, payload: DispatchInput) -> dict:
     async with async_session_factory() as session:
         result = await state_machine.dispatch_fulfillment(session, batch_id, payload.rider_id)
@@ -138,7 +175,7 @@ async def dispatch_order(batch_id: int, payload: DispatchInput) -> dict:
         return result
 
 
-@router.post("/api/orders/{batch_id}/collected")
+@router.post("/api/staff/orders/{batch_id}/collected")
 async def mark_order_collected(batch_id: int) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -157,7 +194,7 @@ async def mark_order_collected(batch_id: int) -> dict:
         return {"status": "collected", "batch_id": batch.id}
 
 
-@router.post("/api/orders/{batch_id}/reassign")
+@router.post("/api/staff/orders/{batch_id}/reassign")
 async def reassign_order(batch_id: int, payload: DispatchInput) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -173,7 +210,7 @@ async def reassign_order(batch_id: int, payload: DispatchInput) -> dict:
         return result
 
 
-@router.post("/api/orders/{batch_id}/failed")
+@router.post("/api/staff/orders/{batch_id}/failed")
 async def mark_order_failed(batch_id: int, payload: FailureInput | None = None) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -206,7 +243,7 @@ async def mark_order_failed(batch_id: int, payload: FailureInput | None = None) 
         return {"status": "failed", "batch_id": batch.id, "reason": reason}
 
 
-@router.post("/api/orders/{batch_id}/not-received")
+@router.post("/api/staff/orders/{batch_id}/not-received")
 async def mark_order_not_received(batch_id: int) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
@@ -226,14 +263,14 @@ async def mark_order_not_received(batch_id: int) -> dict:
         return {"status": "not_received", "batch_id": batch.id}
 
 
-@router.get("/api/riders")
+@router.get("/api/staff/riders")
 async def list_riders() -> list[dict]:
     async with async_session_factory() as session:
         result = await session.execute(select(Rider).where(~Rider.is_archived).order_by(Rider.name))
         return [_rider(rider) for rider in result.scalars()]
 
 
-@router.post("/api/riders")
+@router.post("/api/staff/riders")
 async def create_rider(payload: RiderInput) -> dict:
     try:
         phone = normalize_phone(payload.phone_number)
@@ -251,7 +288,7 @@ async def create_rider(payload: RiderInput) -> dict:
         return _rider(rider)
 
 
-@router.patch("/api/riders/{rider_id}")
+@router.patch("/api/staff/riders/{rider_id}")
 async def update_rider(rider_id: int, payload: RiderInput) -> dict:
     try:
         phone = normalize_phone(payload.phone_number)
@@ -273,7 +310,7 @@ async def update_rider(rider_id: int, payload: RiderInput) -> dict:
         return _rider(rider)
 
 
-@router.post("/api/riders/{rider_id}/archive")
+@router.post("/api/staff/riders/{rider_id}/archive")
 async def archive_rider(rider_id: int) -> dict:
     async with async_session_factory() as session:
         rider = await session.get(Rider, rider_id)
@@ -285,14 +322,14 @@ async def archive_rider(rider_id: int) -> dict:
         return {"status": "archived", "id": rider.id}
 
 
-@router.get("/api/delivery-areas")
+@router.get("/api/staff/delivery-areas")
 async def list_delivery_areas() -> list[dict]:
     async with async_session_factory() as session:
         result = await session.execute(select(DeliveryArea).order_by(DeliveryArea.sort_order, DeliveryArea.name))
         return [_area(area) for area in result.scalars()]
 
 
-@router.post("/api/delivery-areas")
+@router.post("/api/staff/delivery-areas")
 async def create_delivery_area(payload: DeliveryAreaInput) -> dict:
     async with async_session_factory() as session:
         values = payload.model_dump()
@@ -308,7 +345,7 @@ async def create_delivery_area(payload: DeliveryAreaInput) -> dict:
         return _area(area)
 
 
-@router.patch("/api/delivery-areas/{area_id}")
+@router.patch("/api/staff/delivery-areas/{area_id}")
 async def update_delivery_area(area_id: int, payload: DeliveryAreaInput) -> dict:
     async with async_session_factory() as session:
         area = await session.get(DeliveryArea, area_id)
