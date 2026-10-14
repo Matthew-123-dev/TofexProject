@@ -2,7 +2,7 @@
 import asyncio
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 
 from app.database import async_session_factory
 from app.models import MenuItem
@@ -64,32 +64,23 @@ MENU = [
 
 
 async def main() -> None:
-    async with async_session_factory() as session:
-        menu_keys = {(name, category) for name, _, _, category, _, _ in MENU}
-        existing = (await session.execute(select(MenuItem))).scalars().all()
-        placeholders = [item for item in existing if (item.name, item.category) not in menu_keys]
-        for item in placeholders:
-            await session.delete(item)
+    """Load the starter menu ONLY into an empty menu table.
 
-        added = updated = 0
+    It never updates prices/stock or deletes items, so running it again can never wipe
+    staff changes made from the dashboard.
+    """
+    async with async_session_factory() as session:
+        count = await session.scalar(select(func.count()).select_from(MenuItem))
+        if count:
+            print(f"Menu already has {count} items; nothing was changed.")
+            return
         for name, description, price, category, stock, threshold in MENU:
-            result = await session.execute(
-                select(MenuItem).where(MenuItem.name == name, MenuItem.category == category)
-            )
-            item = result.scalar_one_or_none()
-            if item is None:
-                item = MenuItem(name=name, category=category)
-                session.add(item)
-                added += 1
-            else:
-                updated += 1
-            item.description = description or None
-            item.price = Decimal(price)
-            item.is_available = True
-            item.stock_quantity = stock
-            item.low_stock_threshold = threshold
+            session.add(MenuItem(
+                name=name, description=description or None, price=Decimal(price), category=category,
+                is_available=True, stock_quantity=stock, low_stock_threshold=threshold,
+            ))
         await session.commit()
-        print(f"Menu synchronized: {added} added, {updated} updated, {len(placeholders)} placeholders removed.")
+        print(f"Seeded {len(MENU)} menu items.")
 
 
 if __name__ == "__main__":

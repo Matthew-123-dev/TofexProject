@@ -2,9 +2,8 @@ import hashlib
 import hmac
 import json
 import logging
-from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete
+from sqlalchemy.exc import IntegrityError
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 
@@ -19,7 +18,7 @@ router = APIRouter()
 
 def _signature_ok(raw: bytes, header: str | None) -> bool:
     if not settings.whatsapp_app_secret:
-        return settings.app_env != "production"  # allow unsigned requests in local dev only
+        return settings.dry_run  # unsigned requests are accepted ONLY in dry-run (simulator) mode
     if not header or not header.startswith("sha256="):
         return False
     expected = hmac.new(settings.whatsapp_app_secret.encode(), raw, hashlib.sha256).hexdigest()
@@ -50,20 +49,26 @@ async def receive(
     return {"status": "received"}  # return 200 fast; Meta retries slow responses
 
 
+FALLBACK_REPLY = "Sorry, something went wrong on our side. Please try again, or send *menu* to start over."
+
+
 async def process_payload(payload: dict) -> None:
     messages = whatsapp.parse_incoming(payload)
     async with async_session_factory() as session:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-        await session.execute(delete(ProcessedMessage).where(ProcessedMessage.created_at < cutoff))
-        await session.commit()
         for msg in messages:
-            if await session.get(ProcessedMessage, msg.id):
+            try:
+                session.add(ProcessedMessage(message_id=msg.id))
+                await session.commit()  # mark first so Meta's retries are ignored
+            except IntegrityError:
+                await session.rollback()
                 continue  # duplicate delivery
-            session.add(ProcessedMessage(message_id=msg.id))
-            await session.commit()  # mark first so retries are ignored even if handling fails
             try:
                 await state_machine.handle_incoming(session, msg)
                 await session.commit()
             except Exception:
                 logger.exception("Failed handling WhatsApp message %s", msg.id)
                 await session.rollback()
+                try:  # never leave the customer in silence
+                    await whatsapp.send_text(msg.sender, FALLBACK_REPLY)
+                except Exception:
+                    logger.exception("Could not send the fallback reply to %s", msg.sender)

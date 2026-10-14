@@ -1,3 +1,4 @@
+import os
 from decimal import Decimal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -39,6 +40,16 @@ class Settings(BaseSettings):
     staff_username: str = "admin"
     staff_password: str = ""
     session_secret: str = ""
+    session_max_age_hours: int = 12
+
+    @property
+    def is_production(self) -> bool:
+        """True when APP_ENV=production OR the app is running on Railway.
+
+        Railway sets RAILWAY_ENVIRONMENT, so forgetting APP_ENV there cannot silently
+        switch off the production safety checks.
+        """
+        return self.app_env.lower() == "production" or bool(os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("RAILWAY_ENVIRONMENT_NAME"))
 
     @property
     def async_database_url(self) -> str:

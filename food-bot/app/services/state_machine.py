@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import quote_plus
@@ -9,13 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import (
-    Cart, DeliveryArea, Fulfillment, FulfillmentStage, MenuItem, PaymentBatch, Rider, SessionState, User,
+    Cart, DeliveryArea, Fulfillment, FulfillmentStage, MenuItem, OrderStatus, PaymentBatch, Rider, SessionState, User,
 )
 from app.messages import (
     M1_CHOICE, M2_STREET, M3_AREA, M3B_OTHER_AREA, M4_PIN, M5_LANDMARK, M6_SECOND_PHONE, M7_NOTES,
     M8_SUMMARY, M8B_OTHER_AREA, M8C_QUOTE, M9_PAYMENT, M9_PICKUP, M10_RECEIPT, M11_APPROVED,
-    M17_ON_WAY, R1_DISPATCH, R2_PICKED_UP, R3_CONFIRM_DELIVERED, R3_DELIVERED, R4_PICKUP_REMINDER,
-    R5_HELP, R6_REASSIGNED, R7_WINDOW_WARNING, R_ACTIVE, R_INACTIVE,
+    M15_LOCKED, M15B_AREA_LOCKED, M17_ON_WAY, M19_NOT_RECEIVED, M20_FAILED, R1_DISPATCH, R2_PICKED_UP,
+    R3_CONFIRM_DELIVERED, R3_DELIVERED, R5_HELP, R_ACTIVE, R_INACTIVE,
 )
 from app.schemas import IncomingMessage
 from app.services import menu_service, order_service, whatsapp
@@ -26,6 +27,36 @@ logger = logging.getLogger(__name__)
 GREETINGS = {"menu", "hi", "hello", "hey", "start"}
 MENU_PAGE_SIZE = 10
 QUANTITY_PAGE_SIZE = 10
+
+# While a customer is in these stages the conversation belongs to the checkout:
+# the only way out is `cancel`.
+CHECKOUT_LOCKED_STAGES = (
+    FulfillmentStage.COLLECTING_DETAILS,
+    FulfillmentStage.AWAITING_FEE_QUOTE,
+    FulfillmentStage.AWAITING_FEE_ACCEPT,
+)
+IN_PROGRESS_STAGES = (
+    FulfillmentStage.PREPARING, FulfillmentStage.READY,
+    FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY,
+)
+OPEN_DELIVERY_STAGES = (FulfillmentStage.READY, FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY)
+
+# Rider failure reasons: code -> (internal label, wording for the customer)
+FAIL_REASONS = {
+    "1": ("customer unreachable", "we couldn't reach you by phone"),
+    "2": ("wrong address", "the address couldn't be found"),
+    "3": ("customer refused", "the order wasn't accepted on delivery"),
+    "4": ("wrong number", "the phone number provided was incorrect"),
+    "5": ("other", None),
+}
+FAIL_PROMPT = (
+    "Please reply with the reason numbers, for example: 1,3\n1 Customer unreachable\n2 Wrong address\n"
+    "3 Customer refused\n4 Wrong number\n5 Other (add a note, e.g. 5 gate was locked)"
+)
+
+
+class DispatchError(ValueError):
+    """A dispatch was refused for a reason staff can fix (the message is safe to show them)."""
 
 
 async def get_or_create_user(session: AsyncSession, phone: str) -> User:
@@ -48,8 +79,7 @@ async def get_rider_by_phone(session: AsyncSession, phone: str) -> Rider | None:
 
 
 async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
-    """Route one customer message based on what they sent and their current state."""
-    print("INCOMING", msg.type, repr(msg.reply_id), repr(msg.text), flush=True)
+    """Route one WhatsApp message: riders first, then an open checkout, then normal browsing."""
     rider = await get_rider_by_phone(session, msg.sender)
     if rider is not None:
         rider.last_message_at = datetime.now(timezone.utc)
@@ -59,6 +89,23 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     user = await get_or_create_user(session, msg.sender)
     text = (msg.text or "").strip().lower()
     rid = msg.reply_id or ""
+
+    # An open checkout owns the conversation. We route by the ORDER, not by user.current_state,
+    # so browsing the menu can never make the bot ignore a receipt photo or an address answer.
+    open_fulfillment = await get_open_fulfillment(session, user.id)
+    if open_fulfillment is not None and (
+        open_fulfillment.stage in CHECKOUT_LOCKED_STAGES
+        or open_fulfillment.address_editing
+        or msg.type in ("image", "location")
+        or text in {"cancel", "address"}
+        or rid == "cancel"
+    ):
+        return await handle_checkout_flow(session, user, open_fulfillment, msg)
+
+    if text == "address":
+        if await get_in_progress_fulfillment(session, user.id) is not None:
+            await whatsapp.send_text(user.phone_number, M15_LOCKED.format(support_phone=settings.support_phone))
+            return
 
     if text == "profile":
         user.current_state = SessionState.EDITING_PROFILE
@@ -79,6 +126,9 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     if text in GREETINGS or rid == "menu":
         return await handle_menu_request(session, user)
+    if rid.startswith("notreceived:"):
+        batch_text = rid.removeprefix("notreceived:")
+        return await handle_not_received(session, user, int(batch_text) if batch_text.isdigit() else 0)
     if rid.startswith("catpg:"):
         category_page = rid.removeprefix("catpg:")
         if ":" not in category_page:
@@ -110,17 +160,13 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         await whatsapp.send_text(user.phone_number, "Created a new cart. Send *menu* to add items to it.")
         return
     if rid.startswith("cart:"):
-        return await toggle_cart(session, user, int(rid.removeprefix("cart:")))
+        cart_text = rid.removeprefix("cart:")
+        if not cart_text.isdigit():
+            await whatsapp.send_text(user.phone_number, "That cart could not be found.")
+            return
+        return await toggle_cart(session, user, int(cart_text))
     if rid == "checkout":
         return await handle_checkout(session, user)
-
-    if user.current_state in (
-        SessionState.COLLECTING_DETAILS, SessionState.AWAITING_FEE_QUOTE,
-        SessionState.AWAITING_FEE_ACCEPT, SessionState.AWAITING_PAYMENT, SessionState.AWAITING_APPROVAL,
-    ):
-        fulfillment = await get_open_fulfillment(session, user.id)
-        if fulfillment:
-            return await handle_checkout_flow(session, user, fulfillment, msg)
 
     if user.current_state == SessionState.AWAITING_RECEIPT and msg.type == "image" and msg.media_id:
         return await handle_receipt_upload(session, user, msg.media_id)
@@ -128,19 +174,242 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     await whatsapp.send_text(user.phone_number, "Hi! Send *menu* to see what's available right now.")
 
 
+async def get_in_progress_fulfillment(session: AsyncSession, user_id: int) -> Fulfillment | None:
+    result = await session.execute(
+        select(Fulfillment)
+        .join(PaymentBatch, PaymentBatch.id == Fulfillment.payment_batch_id)
+        .where(PaymentBatch.user_id == user_id, Fulfillment.stage.in_(IN_PROGRESS_STAGES))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def handle_not_received(session: AsyncSession, user: User, batch_id: int) -> None:
+    """The customer tapped "Didn't receive it?" on the delivered message."""
+    batch = await order_service.get_batch(session, batch_id)
+    fulfillment = batch.fulfillment if batch else None
+    if batch is None or batch.user_id != user.id or fulfillment is None or fulfillment.stage != FulfillmentStage.DELIVERED:
+        await whatsapp.send_text(user.phone_number, "Sorry, we couldn't find that delivery. Please call " + settings.support_phone + ".")
+        return
+    if fulfillment.not_received_at is None:
+        fulfillment.not_received_at = datetime.now(timezone.utc)
+        fulfillment.not_received_acknowledged_at = None
+    await whatsapp.send_text(user.phone_number, M19_NOT_RECEIVED)
+
+
+def items_summary(batch: PaymentBatch) -> str:
+    """"2 x Jollof rice, 1 x Chapman": for the customer's own failed-delivery message only (never sent to riders)."""
+    parts = [f"{item.quantity} x {item.item_name}" for order in batch.orders for item in order.items]
+    return ", ".join(parts) or "your order"
+
+
+async def fail_fulfillment(
+    session: AsyncSession, batch: PaymentBatch, fulfillment: Fulfillment, *,
+    failed_by: str, internal_reasons: str, customer_reasons: str, note: str | None = None,
+) -> None:
+    """Close a delivery as failed and tell the customer. Used by both riders and staff.
+
+    The batch stays PAID on purpose: the customer did pay, and staff need that record to handle a refund.
+    """
+    fulfillment.stage = FulfillmentStage.FAILED
+    fulfillment.failed_at = datetime.now(timezone.utc)
+    fulfillment.failure_reasons = internal_reasons
+    fulfillment.failure_note = note
+    fulfillment.failed_by = failed_by
+    fulfillment.failed_acknowledged_at = None
+    customer = batch.orders[0].user if batch.orders else None
+    if customer is not None:
+        await whatsapp.send_text(customer.phone_number, M20_FAILED.format(
+            batch=batch.id, items=items_summary(batch), reasons=customer_reasons,
+            refund_timeframe=settings.refund_timeframe, support_phone=settings.support_phone,
+        ))
+
+
+async def _rider_batch(
+    session: AsyncSession, rider: Rider, batch_id: int
+) -> tuple[PaymentBatch | None, Fulfillment | None]:
+    """Load a batch (with orders, items and customer) and make sure it is assigned to this rider."""
+    batch = await order_service.get_batch(session, batch_id)
+    fulfillment = batch.fulfillment if batch else None
+    if batch is None or fulfillment is None or fulfillment.rider_id != rider.id:
+        await whatsapp.send_text(rider.phone_number, f"I couldn't find batch #{batch_id} assigned to you.")
+        return None, None
+    return batch, fulfillment
+
+
+def _deliver_buttons(batch_id: int) -> list[tuple[str, str]]:
+    return [(f"r:deliv:{batch_id}", "Delivered"), (f"r:fail:{batch_id}", "Can't deliver")]
+
+
+async def rider_mark_picked(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    batch, fulfillment = await _rider_batch(session, rider, batch_id)
+    if fulfillment is None:
+        return
+    if fulfillment.stage != FulfillmentStage.DISPATCHED:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not waiting to be picked up right now.")
+        return
+    fulfillment.stage = FulfillmentStage.OUT_FOR_DELIVERY
+    fulfillment.picked_up_at = datetime.now(timezone.utc)
+    fulfillment.rider_reminder_sent_at = None
+    customer = batch.orders[0].user if batch.orders else None
+    if customer is not None:
+        await whatsapp.send_text(customer.phone_number, M17_ON_WAY.format(
+            batch=batch.id, rider_name=rider.name, rider_phone=f"+{rider.phone_number}",
+        ))
+    await whatsapp.send_buttons(rider.phone_number, R2_PICKED_UP.format(batch=batch.id), _deliver_buttons(batch.id))
+
+
+async def rider_ask_confirm_delivered(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    _, fulfillment = await _rider_batch(session, rider, batch_id)
+    if fulfillment is None:
+        return
+    if fulfillment.stage != FulfillmentStage.OUT_FOR_DELIVERY:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not out for delivery right now.")
+        return
+    await whatsapp.send_buttons(
+        rider.phone_number, R3_CONFIRM_DELIVERED.format(batch=batch_id),
+        [(f"r:yes:{batch_id}", "Yes, delivered"), (f"r:no:{batch_id}", "Not yet")],
+    )
+
+
+async def rider_confirm_delivered(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    _, fulfillment = await _rider_batch(session, rider, batch_id)
+    if fulfillment is None:
+        return
+    if fulfillment.stage != FulfillmentStage.OUT_FOR_DELIVERY:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not out for delivery right now.")
+        return
+    now = datetime.now(timezone.utc)
+    fulfillment.stage = FulfillmentStage.DELIVERED
+    fulfillment.delivered_at = now
+    # The customer is thanked by the scheduler after this delay, so the rider can still undo a mistake.
+    fulfillment.thank_you_due_at = now + timedelta(minutes=settings.thank_you_delay_minutes)
+    fulfillment.thank_you_sent_at = None
+    await whatsapp.send_buttons(
+        rider.phone_number, R3_DELIVERED.format(minutes=settings.thank_you_delay_minutes),
+        [(f"r:undo:{batch_id}", "Undo")],
+    )
+
+
+async def rider_undo(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    _, fulfillment = await _rider_batch(session, rider, batch_id)
+    if fulfillment is None:
+        return
+    if fulfillment.stage != FulfillmentStage.DELIVERED:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not marked as delivered.")
+        return
+    if fulfillment.thank_you_sent_at is not None:
+        await whatsapp.send_text(
+            rider.phone_number, "It's too late to undo this: the customer has already been thanked. Please call the office."
+        )
+        return
+    fulfillment.stage = FulfillmentStage.OUT_FOR_DELIVERY
+    fulfillment.delivered_at = None
+    fulfillment.thank_you_due_at = None
+    await whatsapp.send_buttons(
+        rider.phone_number, f"Done. Batch #{batch_id} is back on your route.", _deliver_buttons(batch_id)
+    )
+
+
+async def rider_begin_fail(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    _, fulfillment = await _rider_batch(session, rider, batch_id)
+    if fulfillment is None:
+        return
+    if fulfillment.stage not in OPEN_DELIVERY_STAGES:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} can't be marked as failed right now.")
+        return
+    rider.pending_action = json.dumps({"action": "fail_reasons", "batch_id": batch_id})
+    await whatsapp.send_text(rider.phone_number, FAIL_PROMPT)
+
+
+async def rider_submit_fail_reasons(session: AsyncSession, rider: Rider, text: str, payload: dict) -> None:
+    """The rider answered the numbered list, e.g. "1,3" or "5 gate was locked"."""
+    batch_id = int(payload.get("batch_id", 0))
+    match = re.match(r"^\s*([1-5](?:\s*,\s*[1-5])*)\s*(.*)$", text, re.S)
+    if not match:
+        await whatsapp.send_text(rider.phone_number, FAIL_PROMPT)
+        return
+    codes = list(dict.fromkeys(re.findall(r"[1-5]", match.group(1))))
+    note = match.group(2).strip()[:200] or None
+    labels = ", ".join(FAIL_REASONS[c][0] for c in codes)
+    rider.pending_action = json.dumps({
+        "action": "confirm_fail", "batch_id": batch_id, "codes": codes, "note": note,
+    })
+    await whatsapp.send_buttons(
+        rider.phone_number,
+        f"Mark batch #{batch_id} as failed?\nReason: {labels}" + (f" ({note})" if note else ""),
+        [(f"r:failyes:{batch_id}", "Yes, mark failed"), (f"r:failno:{batch_id}", "Cancel")],
+    )
+
+
+async def rider_confirm_fail(session: AsyncSession, rider: Rider, batch_id: int) -> None:
+    try:
+        payload = json.loads(rider.pending_action or "{}")
+    except ValueError:
+        payload = {}
+    if payload.get("action") != "confirm_fail" or payload.get("batch_id") != batch_id:
+        await whatsapp.send_text(rider.phone_number, f"Nothing to confirm. Send `fail {batch_id}` to start again.")
+        return
+    batch, fulfillment = await _rider_batch(session, rider, batch_id)
+    rider.pending_action = None
+    if fulfillment is None:
+        return
+    if fulfillment.stage not in OPEN_DELIVERY_STAGES:
+        await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} can't be marked as failed right now.")
+        return
+    codes = payload.get("codes", [])
+    note = payload.get("note")
+    customer_phrases = [FAIL_REASONS[c][1] for c in codes if FAIL_REASONS[c][1]]
+    if "5" in codes:
+        customer_phrases.append(note or "an unexpected problem came up")
+    await fail_fulfillment(
+        session, batch, fulfillment, failed_by="rider",
+        internal_reasons=", ".join(FAIL_REASONS[c][0] for c in codes),
+        customer_reasons="; ".join(customer_phrases) or "we could not complete the delivery", note=note,
+    )
+    await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} marked as failed. Thanks for the update.")
+
+
 async def handle_rider_message(session: AsyncSession, rider: Rider, msg: IncomingMessage) -> None:
-    """Handle WhatsApp messages from riders: availability, status updates, and delivery actions."""
+    """Riders talk to the bot with buttons (preferred) or typed commands. They never see customer messages."""
     text = (msg.text or "").strip()
     command = text.lower()
+    rid = msg.reply_id or ""
 
+    # ---- button taps: ids look like "r:picked:12" ----
+    if rid.startswith("r:"):
+        parts = rid.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        batch_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        if action == "picked" and batch_id:
+            return await rider_mark_picked(session, rider, batch_id)
+        if action == "deliv" and batch_id:
+            return await rider_ask_confirm_delivered(session, rider, batch_id)
+        if action == "yes" and batch_id:
+            return await rider_confirm_delivered(session, rider, batch_id)
+        if action == "no":
+            await whatsapp.send_text(rider.phone_number, "No problem. Tap Delivered once you've handed it over.")
+            return
+        if action == "fail" and batch_id:
+            return await rider_begin_fail(session, rider, batch_id)
+        if action == "failyes" and batch_id:
+            return await rider_confirm_fail(session, rider, batch_id)
+        if action == "failno":
+            rider.pending_action = None
+            await whatsapp.send_text(rider.phone_number, "Okay, nothing was changed.")
+            return
+        if action == "undo" and batch_id:
+            return await rider_undo(session, rider, batch_id)
+        await whatsapp.send_text(rider.phone_number, R5_HELP)
+        return
+
+    # ---- simple commands ----
     if command in {"active", "activate", "on"}:
         rider.is_active = True
-        rider.last_message_at = datetime.now(timezone.utc)
         await whatsapp.send_text(rider.phone_number, R_ACTIVE)
         return
     if command in {"inactive", "deactivate", "off"}:
         rider.is_active = False
-        rider.last_message_at = datetime.now(timezone.utc)
         await whatsapp.send_text(rider.phone_number, R_INACTIVE)
         return
     if command in {"help", "?", "commands"}:
@@ -149,174 +418,40 @@ async def handle_rider_message(session: AsyncSession, rider: Rider, msg: Incomin
     if command == "pending":
         result = await session.execute(
             select(Fulfillment)
-            .where(Fulfillment.rider_id == rider.id)
-            .where(Fulfillment.stage.in_([
-                FulfillmentStage.READY,
-                FulfillmentStage.DISPATCHED,
-                FulfillmentStage.OUT_FOR_DELIVERY,
-            ]))
+            .where(Fulfillment.rider_id == rider.id, Fulfillment.stage.in_(OPEN_DELIVERY_STAGES))
             .order_by(Fulfillment.id.desc())
         )
         items = result.scalars().all()
         if not items:
             await whatsapp.send_text(rider.phone_number, "You have no active deliveries right now.")
             return
-        body = "Your deliveries:\n" + "\n".join(
-            f"• Batch #{f.payment_batch_id} — {f.stage.value}" for f in items
-        )
-        await whatsapp.send_text(rider.phone_number, body)
-        return
-    if command.startswith("picked "):
-        try:
-            batch_id = int(command.split(" ", 1)[1])
-        except ValueError:
-            await whatsapp.send_text(rider.phone_number, "Please send `picked <batch>`.")
-            return
-        fulfillment = await session.execute(
-            select(Fulfillment).where(Fulfillment.payment_batch_id == batch_id, Fulfillment.rider_id == rider.id)
-        )
-        fulfillment = fulfillment.scalar_one_or_none()
-        if fulfillment is None:
-            await whatsapp.send_text(rider.phone_number, "I couldn't find that batch assigned to you.")
-            return
-        if fulfillment.stage != FulfillmentStage.DISPATCHED:
-            await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not waiting to be picked up right now.")
-            return
-        fulfillment.stage = FulfillmentStage.OUT_FOR_DELIVERY
-        fulfillment.picked_up_at = datetime.now(timezone.utc)
-        fulfillment.rider_reminder_sent_at = None
-        batch = await session.get(PaymentBatch, batch_id)
-        if batch and batch.user:
-            await whatsapp.send_text(batch.user.phone_number, M17_ON_WAY.format(
-                batch=batch.id,
-                rider_name=rider.name,
-                rider_phone=rider.phone_number,
-            ))
-        await whatsapp.send_text(rider.phone_number, R2_PICKED_UP.format(batch=batch_id))
-        return
-    if command.startswith("delivered "):
-        try:
-            batch_id = int(command.split(" ", 1)[1])
-        except ValueError:
-            await whatsapp.send_text(rider.phone_number, "Please send `delivered <batch>`.")
-            return
-        fulfillment = await session.execute(
-            select(Fulfillment).where(Fulfillment.payment_batch_id == batch_id, Fulfillment.rider_id == rider.id)
-        )
-        fulfillment = fulfillment.scalar_one_or_none()
-        if fulfillment is None:
-            await whatsapp.send_text(rider.phone_number, "I couldn't find that batch assigned to you.")
-            return
-        if fulfillment.stage != FulfillmentStage.OUT_FOR_DELIVERY:
-            await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not out for delivery right now.")
-            return
-        await whatsapp.send_text(rider.phone_number, R3_CONFIRM_DELIVERED.format(batch=batch_id))
-        return
-    if command.startswith("fail "):
-        try:
-            batch_id = int(command.split(" ", 1)[1])
-        except ValueError:
-            await whatsapp.send_text(rider.phone_number, "Please send `fail <batch>`.")
-            return
-        rider.pending_action = json.dumps({"action": "fail", "batch_id": batch_id})
         await whatsapp.send_text(
             rider.phone_number,
-            "Please reply with the reason numbers, for example: 1,3\n1 Customer unreachable\n2 Wrong address\n3 Customer refused\n4 Wrong number\n5 Other (add a note)",
+            "Your deliveries:\n" + "\n".join(f"• Batch #{f.payment_batch_id}: {f.stage.value}" for f in items),
         )
         return
-    if command.startswith("undo "):
+
+    typed = re.match(r"^(picked|delivered|fail|undo)\s+#?(\d+)$", command)
+    if typed:
+        verb, batch_id = typed.group(1), int(typed.group(2))
+        if verb == "picked":
+            return await rider_mark_picked(session, rider, batch_id)
+        if verb == "delivered":
+            return await rider_ask_confirm_delivered(session, rider, batch_id)
+        if verb == "fail":
+            return await rider_begin_fail(session, rider, batch_id)
+        return await rider_undo(session, rider, batch_id)
+
+    # ---- the rider is answering the "failure reasons" question ----
+    if rider.pending_action and text:
         try:
-            batch_id = int(command.split(" ", 1)[1])
-        except ValueError:
-            await whatsapp.send_text(rider.phone_number, "Please send `undo <batch>`.")
-            return
-        fulfillment = await session.execute(
-            select(Fulfillment).where(Fulfillment.payment_batch_id == batch_id, Fulfillment.rider_id == rider.id)
-        )
-        fulfillment = fulfillment.scalar_one_or_none()
-        if fulfillment is None:
-            await whatsapp.send_text(rider.phone_number, "I couldn't find that batch assigned to you.")
-            return
-        if fulfillment.stage != FulfillmentStage.DELIVERED:
-            await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} is not marked delivered.")
-            return
-        fulfillment.stage = FulfillmentStage.OUT_FOR_DELIVERY
-        fulfillment.delivered_at = None
-        fulfillment.thank_you_due_at = None
-        fulfillment.thank_you_sent_at = None
-        await whatsapp.send_text(rider.phone_number, f"Delivery #{batch_id} was undone and put back on the route.")
-        return
-
-    if command[:1].isdigit():
-        if rider.pending_action:
             payload = json.loads(rider.pending_action)
-            if payload.get("action") == "fail":
-                batch_id = int(payload.get("batch_id", 0))
-                reasons = [part.strip() for part in command.split(",") if part.strip()]
-                fulfillment = await session.execute(
-                    select(Fulfillment).where(Fulfillment.payment_batch_id == batch_id, Fulfillment.rider_id == rider.id)
-                )
-                fulfillment = fulfillment.scalar_one_or_none()
-                if fulfillment and fulfillment.stage in {FulfillmentStage.READY, FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY}:
-                    fulfillment.stage = FulfillmentStage.FAILED
-                    fulfillment.failed_at = datetime.now(timezone.utc)
-                    fulfillment.failure_reasons = ", ".join(reasons)
-                    fulfillment.failed_by = "rider"
-                    batch = await session.get(PaymentBatch, batch_id)
-                    if batch:
-                        batch.status = OrderStatus.CANCELLED
-                        for order in batch.orders:
-                            order.status = OrderStatus.CANCELLED
-                        if batch.user:
-                            await whatsapp.send_text(
-                                batch.user.phone_number,
-                                M20_FAILED.format(
-                                    batch=batch.id,
-                                    items="items",
-                                    reasons=fulfillment.failure_reasons,
-                                    refund_timeframe=settings.refund_timeframe,
-                                    support_phone=settings.support_phone,
-                                ),
-                            )
-                    rider.pending_action = None
-                    await whatsapp.send_text(rider.phone_number, f"Batch #{batch_id} marked as failed. Thanks for the update.")
-                    return
-        await whatsapp.send_text(rider.phone_number, R5_HELP)
-        return
-
-    if msg.reply_id == "confirm-delivery" and rider.pending_action:
-        payload = json.loads(rider.pending_action)
-        if payload.get("action") == "confirm_delivered":
-            batch_id = int(payload.get("batch_id", 0))
-            fulfillment = await session.execute(
-                select(Fulfillment).where(Fulfillment.payment_batch_id == batch_id, Fulfillment.rider_id == rider.id)
-            )
-            fulfillment = fulfillment.scalar_one_or_none()
-            if fulfillment and fulfillment.stage == FulfillmentStage.OUT_FOR_DELIVERY:
-                fulfillment.stage = FulfillmentStage.DELIVERED
-                fulfillment.delivered_at = datetime.now(timezone.utc)
-                fulfillment.thank_you_due_at = datetime.now(timezone.utc) + timedelta(minutes=settings.thank_you_delay_minutes)
-                rider.pending_action = None
-                batch = await session.get(PaymentBatch, batch_id)
-                if batch and batch.user:
-                    await whatsapp.send_text(
-                        batch.user.phone_number,
-                        M18_DELIVERED.format(batch=batch.id, brand_name=settings.brand_name),
-                    )
-                await whatsapp.send_text(rider.phone_number, R3_DELIVERED.format(minutes=settings.thank_you_delay_minutes))
-                return
+        except ValueError:
+            payload = {}
+        if payload.get("action") == "fail_reasons":
+            return await rider_submit_fail_reasons(session, rider, text, payload)
 
     await whatsapp.send_text(rider.phone_number, R5_HELP)
-
-
-async def handle_menu_request(session: AsyncSession, user: User) -> None:
-    user.current_state = SessionState.BROWSING
-    categories = await menu_service.get_categories(session)
-    if not categories:
-        await whatsapp.send_text(user.phone_number, "Sorry, nothing is available right now. Please check back soon.")
-        return
-    rows = [{"id": f"cat:{c}", "title": c[:24]} for c in categories]
-    await whatsapp.send_list(user.phone_number, "What would you like to order?", "View menu", "Categories", rows)
 
 
 async def handle_menu_request(session: AsyncSession, user: User) -> None:
@@ -434,6 +569,23 @@ async def handle_add_item(
 
 
 async def handle_checkout(session: AsyncSession, user: User) -> None:
+    # One open checkout at a time. Without this, tapping an old "Checkout" button created a
+    # second order and sent the customer back to the Delivery/Pickup question.
+    open_fulfillment = await get_open_fulfillment(session, user.id)
+    if open_fulfillment is not None:
+        if open_fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL:
+            text = (
+                f"Your order #{open_fulfillment.payment_batch_id} is waiting for payment confirmation. "
+                "You can place another order once it has been approved."
+            )
+        else:
+            text = (
+                f"You already have order #{open_fulfillment.payment_batch_id} in progress. "
+                "Please finish it first, or send *cancel* to cancel it and start again."
+            )
+        await whatsapp.send_text(user.phone_number, text)
+        return
+
     cart_ids = await order_service.get_selected_cart_ids(session, user.id)
     if not cart_ids:
         await whatsapp.send_text(
@@ -442,7 +594,13 @@ async def handle_checkout(session: AsyncSession, user: User) -> None:
         )
         await show_carts(session, user)
         return
-    batch = await order_service.create_orders_from_carts(session, user, cart_ids)
+    try:
+        batch = await order_service.create_orders_from_carts(session, user, cart_ids)
+    except order_service.CheckoutError as exc:
+        await whatsapp.send_text(
+            user.phone_number, f"Sorry, we can't check out yet: {exc}. Please send *menu* to update your cart."
+        )
+        return
     if batch is None:
         await whatsapp.send_text(user.phone_number, "Your selected carts are empty. Send *menu* to start.")
         return
@@ -451,19 +609,14 @@ async def handle_checkout(session: AsyncSession, user: User) -> None:
         if cart:
             cart.is_selected = False
 
+    now = datetime.now(timezone.utc)
     if batch.fulfillment is None:
-        batch.fulfillment = Fulfillment(
-            payment_batch_id=batch.id,
-            fulfillment_type="delivery",
-            stage=FulfillmentStage.COLLECTING_DETAILS,
-            checkout_step="choice",
-            timer_started_at=datetime.now(timezone.utc),
-        )
-    else:
-        batch.fulfillment.fulfillment_type = "delivery"
-        batch.fulfillment.stage = FulfillmentStage.COLLECTING_DETAILS
-        batch.fulfillment.checkout_step = "choice"
-        batch.fulfillment.timer_started_at = datetime.now(timezone.utc)
+        batch.fulfillment = Fulfillment(payment_batch_id=batch.id)
+    batch.fulfillment.fulfillment_type = "delivery"
+    batch.fulfillment.stage = FulfillmentStage.COLLECTING_DETAILS
+    batch.fulfillment.checkout_step = "choice"
+    batch.fulfillment.timer_started_at = now
+    batch.fulfillment.reminders_sent = "[]"
     await session.flush()
 
     user.current_state = SessionState.COLLECTING_DETAILS
@@ -539,42 +692,93 @@ async def get_open_fulfillment(session: AsyncSession, user_id: int) -> Fulfillme
     return result.scalar_one_or_none()
 
 
+async def cancel_checkout(session: AsyncSession, user: User, batch: PaymentBatch, fulfillment: Fulfillment) -> None:
+    """Cancel an order that has not been approved yet (batch.orders must already be loaded)."""
+    fulfillment.stage = FulfillmentStage.CANCELLED
+    fulfillment.cancelled_at = datetime.now(timezone.utc)
+    fulfillment.timer_started_at = None
+    fulfillment.address_editing = False
+    fulfillment.checkout_step = None
+    batch.status = OrderStatus.CANCELLED
+    for order in batch.orders:
+        order.status = OrderStatus.CANCELLED
+    user.current_state = SessionState.BROWSING
+    await whatsapp.send_text(
+        user.phone_number, f"Order #{batch.id} has been cancelled. Send *menu* whenever you'd like to start again."
+    )
+
+
+async def start_address_edit(session: AsyncSession, user: User, fulfillment: Fulfillment) -> None:
+    """The customer replied ADDRESS: let them re-enter everything except the area."""
+    if fulfillment.fulfillment_type == "pickup":
+        await whatsapp.send_text(user.phone_number, "This is a pickup order, so there is no delivery address to change.")
+        return
+    fulfillment.address_editing = True
+    fulfillment.address_edit_started_at = datetime.now(timezone.utc)
+    if fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL:
+        await whatsapp.send_text(user.phone_number, M15B_AREA_LOCKED.format(support_phone=settings.support_phone))
+    else:
+        await whatsapp.send_text(
+            user.phone_number,
+            "You can change your street, landmark, second phone and notes, but your area must stay the same. "
+            f"To change your area, please call {settings.support_phone}.",
+        )
+    await begin_address(session, user, fulfillment, keep_area=True)
+
+
 async def handle_checkout_flow(
     session: AsyncSession, user: User, fulfillment: Fulfillment, msg: IncomingMessage
 ) -> None:
-    """Process a message arriving while customer is in a checkout stage."""
+    """Process a message arriving while the customer has an open checkout."""
     text = (msg.text or "").strip()
     lowered = text.lower()
-    batch = await session.get(PaymentBatch, fulfillment.payment_batch_id)
+    batch = await order_service.get_batch(session, fulfillment.payment_batch_id)
     if batch is None:
         user.current_state = SessionState.BROWSING
         await whatsapp.send_text(user.phone_number, "I couldn't find that order. Send *menu* to start again.")
         return
+    stage = fulfillment.stage
+    cancelling = lowered == "cancel" or msg.reply_id == "cancel"
 
-    if lowered == "cancel" or msg.reply_id == "cancel":
-        fulfillment.stage = FulfillmentStage.CANCELLED
-        fulfillment.cancelled_at = datetime.now(timezone.utc)
-        batch.status = "cancelled"
-        user.current_state = SessionState.BROWSING
-        await whatsapp.send_text(user.phone_number, f"Order #{batch.id} has been cancelled. Send *menu* whenever you'd like to start again.")
+    # Changing the address after checkout: keep answering the address questions.
+    if fulfillment.address_editing and fulfillment.checkout_step:
+        if cancelling:
+            fulfillment.address_editing = False
+            fulfillment.address_edit_started_at = None
+            fulfillment.checkout_step = None
+            user.current_state = (
+                SessionState.AWAITING_APPROVAL if stage == FulfillmentStage.AWAITING_APPROVAL
+                else SessionState.AWAITING_PAYMENT
+            )
+            await whatsapp.send_text(user.phone_number, "Okay, we kept your current delivery address.")
+            return
+        await process_address_step(session, user, fulfillment, msg)
         return
 
-    if fulfillment.stage == FulfillmentStage.AWAITING_FEE_QUOTE:
+    if cancelling:
+        if stage == FulfillmentStage.AWAITING_APPROVAL:
+            await whatsapp.send_text(
+                user.phone_number,
+                f"Your payment for order #{batch.id} is already being reviewed, so it can't be cancelled here. "
+                f"Please call {settings.support_phone}.",
+            )
+            return
+        await cancel_checkout(session, user, batch, fulfillment)
+        return
+
+    if stage == FulfillmentStage.AWAITING_FEE_QUOTE:
         await whatsapp.send_text(user.phone_number, M8B_OTHER_AREA)
         return
 
-    if fulfillment.stage == FulfillmentStage.AWAITING_FEE_ACCEPT:
+    if stage == FulfillmentStage.AWAITING_FEE_ACCEPT:
         if msg.reply_id == "quote:accept":
             fulfillment.stage = FulfillmentStage.AWAITING_PAYMENT
             fulfillment.timer_started_at = datetime.now(timezone.utc)
+            fulfillment.reminders_sent = "[]"
             user.current_state = SessionState.AWAITING_PAYMENT
             await send_payment_message(user, batch, fulfillment)
         elif msg.reply_id == "quote:cancel":
-            fulfillment.stage = FulfillmentStage.CANCELLED
-            fulfillment.cancelled_at = datetime.now(timezone.utc)
-            batch.status = "cancelled"
-            user.current_state = SessionState.BROWSING
-            await whatsapp.send_text(user.phone_number, f"Order #{batch.id} has been cancelled. Send *menu* whenever you'd like to start again.")
+            await cancel_checkout(session, user, batch, fulfillment)
         else:
             fee = batch.delivery_fee or Decimal("0")
             await whatsapp.send_buttons(user.phone_number, M8C_QUOTE.format(
@@ -582,37 +786,29 @@ async def handle_checkout_flow(
             ), [("quote:accept", "Proceed to pay"), ("quote:cancel", "Cancel order")])
         return
 
-    if fulfillment.stage == FulfillmentStage.AWAITING_PAYMENT:
+    if stage == FulfillmentStage.AWAITING_PAYMENT:
         if msg.type == "image" and msg.media_id:
             batch.receipt_media_id = msg.media_id
             fulfillment.stage = FulfillmentStage.AWAITING_APPROVAL
+            fulfillment.timer_started_at = None  # the customer has paid; from here only staff can act
             user.current_state = SessionState.AWAITING_APPROVAL
             await whatsapp.send_text(user.phone_number, M10_RECEIPT)
             return
-        elif lowered == "address":
-            fulfillment.address_editing = True
-            fulfillment.address_edit_started_at = datetime.now(timezone.utc)
-            await whatsapp.send_text(user.phone_number, "You may edit your street, landmark, second phone and notes. The area must stay the same.")
-            await begin_address(session, user, fulfillment, keep_area=True)
-            return
-        else:
-            await whatsapp.send_text(user.phone_number, "Please send your payment receipt photo, reply ADDRESS to update your address, or send cancel.")
-            return
-
-    if fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL:
         if lowered == "address":
-            await begin_address(session, user, fulfillment, keep_area=True)
+            await start_address_edit(session, user, fulfillment)
+            return
+        await whatsapp.send_text(
+            user.phone_number,
+            "Please send your payment receipt photo, reply ADDRESS to update your address, or send cancel.",
+        )
+        return
+
+    if stage == FulfillmentStage.AWAITING_APPROVAL:
+        if lowered == "address":
+            await start_address_edit(session, user, fulfillment)
             return
         await whatsapp.send_text(user.phone_number, "Your order is being reviewed. You'll hear from us shortly.")
         return
-
-    if fulfillment.stage in {FulfillmentStage.PREPARING, FulfillmentStage.READY, FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY}:
-        if lowered == "cancel":
-            await whatsapp.send_text(
-                user.phone_number,
-                "Your order is already in progress and cannot be cancelled from here. Please contact support.",
-            )
-            return
 
     await process_address_step(session, user, fulfillment, msg)
 
@@ -661,7 +857,6 @@ async def process_address_step(
             fulfillment.area_id = area.id
             fulfillment.area_name = area.name
             fulfillment.expected_minutes = area.expected_minutes
-            fulfillment._quoted_fee = area.fee
             fulfillment.checkout_step = "street"
             await whatsapp.send_text(user.phone_number, M2_STREET)
             return
@@ -733,17 +928,30 @@ async def process_address_step(
 
     if step == "summary":
         if msg.reply_id == "address:edit":
-            fulfillment.checkout_step = "street"
             fulfillment.street = None
             fulfillment.landmark = None
             fulfillment.phone2 = None
             fulfillment.notes = None
-            await whatsapp.send_text(user.phone_number, M2_STREET)
+            if fulfillment.address_editing:  # after checkout the area is locked, so restart at the street
+                fulfillment.checkout_step = "street"
+                await whatsapp.send_text(user.phone_number, M2_STREET)
+            else:  # still checking out: start over from the area so a wrong area can be corrected
+                fulfillment.area_id = None
+                fulfillment.area_name = None
+                fulfillment.latitude = None
+                fulfillment.longitude = None
+                fulfillment.checkout_step = "area"
+                await send_area_page(session, user, fulfillment, 0)
         elif msg.reply_id == "address:confirm":
             await confirm_address(session, user, fulfillment)
         else:
             await send_summary(session, user, fulfillment)
         return
+
+    # Unknown step (should never happen): never leave the customer in silence.
+    await whatsapp.send_text(
+        user.phone_number, "Sorry, I lost track of where we were. Please send *cancel* and start your order again."
+    )
 
 
 async def begin_address(session: AsyncSession, user: User, fulfillment: Fulfillment, keep_area: bool = False) -> None:
@@ -783,41 +991,59 @@ async def send_area_page(session: AsyncSession, user: User, fulfillment: Fulfill
 
 
 async def send_summary(session: AsyncSession, user: User, fulfillment: Fulfillment) -> None:
-    """Show a summary of the collected address for confirmation."""
-    batch = await session.get(PaymentBatch, fulfillment.payment_batch_id)
+    """Show the collected address, the delivery fee and the total for confirmation."""
+    batch = await order_service.get_batch(session, fulfillment.payment_batch_id)
     if batch is None:
         return
-    fee = getattr(fulfillment, "_quoted_fee", batch.delivery_fee or Decimal("0"))
+    subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
+    area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
+    if area is not None:
+        fee_text, total_text = naira(area.fee), naira(subtotal + area.fee)
+    else:  # "Other area": staff will quote the fee after the customer confirms
+        fee_text, total_text = "to be confirmed", f"{naira(subtotal)} + delivery fee"
     body = M8_SUMMARY.format(
         street=fulfillment.street, area=fulfillment.area_name, landmark=fulfillment.landmark,
         second_phone_line=f"Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else "",
         notes_line=f"Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
-        subtotal=naira(batch.total_amount - (batch.delivery_fee or Decimal("0"))),
-        fee=naira(fee), total=naira(batch.total_amount + (fee if fulfillment.area_id else Decimal("0"))),
+        subtotal=naira(subtotal), fee=fee_text, total=total_text,
     )
     await whatsapp.send_buttons(user.phone_number, body, [("address:confirm", "Confirm"), ("address:edit", "Edit")])
 
 
 async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfillment) -> None:
-    """Confirm the address: set fee for known areas or move to awaiting quote for others."""
-    batch = await session.get(PaymentBatch, fulfillment.payment_batch_id)
+    """Confirm the address: set the fee for known areas, or ask staff for a quote for other areas."""
+    # get_batch loads batch.orders up front. (Reading batch.orders on a batch fetched with
+    # session.get() raises MissingGreenlet in async code.)
+    batch = await order_service.get_batch(session, fulfillment.payment_batch_id)
     if batch is None:
         return
+    now = datetime.now(timezone.utc)
+
+    if fulfillment.address_editing:  # a change after checkout: the order stays exactly where it was
+        fulfillment.address_editing = False
+        fulfillment.address_edit_started_at = None
+        fulfillment.checkout_step = None
+        user.current_state = (
+            SessionState.AWAITING_APPROVAL if fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL
+            else SessionState.AWAITING_PAYMENT
+        )
+        await whatsapp.send_text(user.phone_number, "Your delivery address has been updated ✅")
+        return
+
     area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
     if area:
         batch.delivery_fee = area.fee
         batch.total_amount = sum((order.subtotal for order in batch.orders), Decimal("0")) + area.fee
         fulfillment.expected_minutes = area.expected_minutes
         fulfillment.stage = FulfillmentStage.AWAITING_PAYMENT
-        fulfillment.timer_started_at = datetime.now(timezone.utc)
-        fulfillment.address_editing = False
+        fulfillment.timer_started_at = now
+        fulfillment.reminders_sent = "[]"
         fulfillment.checkout_step = None
         user.current_state = SessionState.AWAITING_PAYMENT
         await send_payment_message(user, batch, fulfillment)
     else:
         fulfillment.stage = FulfillmentStage.AWAITING_FEE_QUOTE
-        fulfillment.timer_started_at = None
-        fulfillment.address_editing = False
+        fulfillment.timer_started_at = None  # paused while staff work out the fee
         fulfillment.checkout_step = None
         user.current_state = SessionState.AWAITING_FEE_QUOTE
         await whatsapp.send_text(user.phone_number, M8B_OTHER_AREA)
@@ -837,56 +1063,63 @@ def build_map_link(fulfillment: Fulfillment) -> str:
 
 
 async def dispatch_fulfillment(session: AsyncSession, batch_id: int, rider_id: int, *, resend: bool = False) -> dict:
-    """Dispatch a batch to a rider and send the rider message. Returns status and optional error."""
+    """Send a ready delivery to a rider. Raises DispatchError for problems staff can fix."""
     batch = await order_service.get_batch(session, batch_id)
     if batch is None:
-        raise ValueError("Batch not found")
+        raise DispatchError("Order not found")
     fulfillment = batch.fulfillment
-    if fulfillment is None:
-        raise ValueError("Fulfillment record not found")
+    if fulfillment is None or not batch.orders:
+        raise DispatchError("This order has no delivery record")
+    if fulfillment.fulfillment_type != "delivery":
+        raise DispatchError("Pickup orders are not sent to riders")
+    if resend and fulfillment.stage != FulfillmentStage.DISPATCHED:
+        raise DispatchError("Only a dispatched delivery can be reassigned")
+    if fulfillment.stage not in {FulfillmentStage.READY, FulfillmentStage.DISPATCHED}:
+        raise DispatchError("Mark the order Ready before dispatching it")
 
     rider = await session.get(Rider, rider_id)
-    if rider is None or rider.is_archived or not rider.is_active:
-        raise ValueError("Rider is not available for dispatch")
-    if rider.last_message_at is not None:
-        if datetime.now(timezone.utc) - rider.last_message_at > timedelta(hours=24):
-            raise ValueError("Rider is inactive for dispatch")
+    if rider is None or rider.is_archived:
+        raise DispatchError("Rider not found")
+    now = datetime.now(timezone.utc)
+    if (
+        not rider.is_active
+        or rider.last_message_at is None
+        or now - rider.last_message_at > timedelta(hours=24)
+    ):
+        raise DispatchError("That rider isn't available. Ask them to send ACTIVE to the bot, then try again.")
 
-    if fulfillment.stage not in {FulfillmentStage.READY, FulfillmentStage.DISPATCHED} and not resend:
-        raise ValueError("Batch is not ready for dispatch")
-
+    customer = batch.orders[0].user
     order_numbers = ", ".join(str(order.id) for order in batch.orders)
     n_items = sum(sum(item.quantity for item in order.items) for order in batch.orders)
-    second_phone_line = f"Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else ""
-    notes_line = f"Notes: {fulfillment.notes}\n" if fulfillment.notes else ""
     rider_message = R1_DISPATCH.format(
         batch=batch.id,
         order_numbers=order_numbers,
-        name=batch.orders[0].user.name or batch.orders[0].user.phone_number,
-        phone=batch.orders[0].user.phone_number,
+        name=customer.name or customer.phone_number,
+        phone=customer.phone_number,
         street=fulfillment.street or "",
         area=fulfillment.area_name or "",
         landmark=fulfillment.landmark or "",
-        second_phone_line=second_phone_line,
-        notes_line=notes_line,
+        second_phone_line=f"Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else "",
+        notes_line=f"Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
         map_link=build_map_link(fulfillment),
         n=n_items,
         m=len(batch.orders),
     )
-
-    sent = await whatsapp.send_text(rider.phone_number, rider_message)
+    sent = await whatsapp.send_buttons(
+        rider.phone_number, rider_message,
+        [(f"r:picked:{batch.id}", "Picked up"), (f"r:fail:{batch.id}", "Can't deliver")],
+    )
     if not sent:
-        fulfillment.dispatch_error = "WhatsApp send failed"
-        if fulfillment.stage == FulfillmentStage.DISPATCHED:
-            fulfillment.stage = FulfillmentStage.READY
-        return {"status": "failed", "batch_id": batch.id, "rider_id": rider.id, "error": "send failed"}
+        fulfillment.dispatch_error = "WhatsApp could not deliver the message to the rider"
+        return {"status": "failed", "batch_id": batch.id, "rider_id": rider.id, "error": fulfillment.dispatch_error}
 
     fulfillment.rider_id = rider.id
     fulfillment.dispatch_error = None
     fulfillment.stage = FulfillmentStage.DISPATCHED
-    fulfillment.dispatched_at = datetime.now(timezone.utc)
+    fulfillment.dispatched_at = now
+    fulfillment.rider_reminder_sent_at = None
     if fulfillment.approved_at is None:
-        fulfillment.approved_at = datetime.now(timezone.utc)
+        fulfillment.approved_at = now
     return {"status": "dispatched", "batch_id": batch.id, "rider_id": rider.id}
 
 

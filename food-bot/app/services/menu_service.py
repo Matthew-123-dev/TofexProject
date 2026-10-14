@@ -104,7 +104,7 @@ async def decrement_stock(session: AsyncSession, order: Order) -> list[str]:
     alerts: list[str] = []
     for oi in order.items:
         item = oi.item
-        if item.stock_quantity is None:
+        if item is None or item.stock_quantity is None:
             continue
         item.stock_quantity = max(0, item.stock_quantity - oi.quantity)
         if item.stock_quantity <= item.low_stock_threshold and item.is_available:
@@ -112,6 +112,6 @@ async def decrement_stock(session: AsyncSession, order: Order) -> list[str]:
             _touch(item)
             alerts.append(
                 f"⚠️ {item.name} is down to {item.stock_quantity} (threshold {item.low_stock_threshold}) "
-                f"and is now hidden from the menu.\nRestock with: /stock {item.name} <quantity>"
+                f"and is now hidden from the menu. Update its stock in Manage Menu to show it again."
             )
     return alerts

@@ -37,8 +37,12 @@ async def _send(payload: dict) -> bool:
         return True
     url = f"{GRAPH}/{settings.whatsapp_api_version}/{settings.whatsapp_phone_number_id}/messages"
     body = {"messaging_product": "whatsapp", **payload}
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(url, headers=_headers(), json=body)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, headers=_headers(), json=body)
+    except httpx.HTTPError:
+        logger.exception("WhatsApp send failed (network error)")
+        return False
     if r.status_code >= 400:
         logger.error("WhatsApp send failed: %s %s", r.status_code, r.text)
         return False
@@ -56,7 +60,7 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": body},
+            "body": {"text": body[:1024]},
             "action": {"buttons": [
                 {"type": "reply", "reply": {"id": i, "title": t[:20]}} for i, t in buttons[:3]
             ]},

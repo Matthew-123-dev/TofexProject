@@ -12,6 +12,10 @@ from app.models import (
 from app.utils import naira
 
 
+class CheckoutError(Exception):
+    """Raised when a cart cannot be checked out (item sold out, not enough stock)."""
+
+
 async def get_or_create_cart(session: AsyncSession, user_id: int) -> Cart:
     user = await session.get(User, user_id)
     if user and user.active_cart_id:
@@ -91,9 +95,7 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     cart_lines = [(cart_id, lines) for cart_id, lines in cart_lines if lines]
     if not cart_lines:
         return None
-        for cart_id, _ in cart_lines:
-            if await session.get(Cart, cart_id) is None:
-                raise ValueError("One or more carts could not be found")
+    _check_stock(cart_lines)
     subtotal = sum((cart_subtotal(lines) for _, lines in cart_lines), Decimal("0"))
     batch = PaymentBatch(
         user_id=user.id,
@@ -132,6 +134,24 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     await session.execute(delete(CartItem).where(CartItem.cart_id.in_([cart_id for cart_id, _ in cart_lines])))
     await session.flush()
     return batch
+
+
+def _check_stock(cart_lines: list[tuple[int, list[tuple[CartItem, MenuItem]]]]) -> None:
+    """Re-check availability at checkout: items may have sold out since they were added to a cart."""
+    wanted: dict[int, tuple[MenuItem, int]] = {}
+    for _, lines in cart_lines:
+        for cart_item, item in lines:
+            _, qty = wanted.get(item.id, (item, 0))
+            wanted[item.id] = (item, qty + cart_item.quantity)
+    problems = []
+    for item, qty in wanted.values():
+        limit = item.sellable_units
+        if not item.is_available or limit == 0:
+            problems.append(f"{item.name} is no longer available")
+        elif limit is not None and qty > limit:
+            problems.append(f"only {limit} {item.name} left (you have {qty})")
+    if problems:
+        raise CheckoutError("; ".join(problems))
 
 
 def _order_query():

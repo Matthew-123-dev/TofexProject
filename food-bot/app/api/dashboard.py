@@ -5,18 +5,21 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.database import async_session_factory
-from app.messages import M8C_QUOTE, M19_NOT_RECEIVED, M20_FAILED
+from app.messages import (
+    M8C_QUOTE, M11_APPROVED, M12_REJECTED, M16_PICKUP_READY, M18B_COLLECTED, R6_REASSIGNED,
+)
 from app.models import (
     CartItem,
     DeliveryArea,
     Fulfillment,
     FulfillmentStage,
     MenuItem,
+    OrderItem,
     OrderStatus,
     PaymentBatch,
     Rider,
@@ -96,8 +99,12 @@ async def update_menu_item(item_id: int, payload: MenuItemInput) -> dict:
         item = await session.get(MenuItem, item_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Menu item not found")
+        stock_before = (item.stock_quantity, item.low_stock_threshold)
         for key, value in payload.model_dump().items():
             setattr(item, key, value)
+        if item.stock_quantity is not None and (item.stock_quantity, item.low_stock_threshold) != stock_before:
+            # Changing the stock count or threshold re-checks availability (so restocking brings an item back).
+            item.is_available = item.stock_quantity > item.low_stock_threshold
         menu_service._touch(item)
         await session.commit()
         await session.refresh(item)
@@ -110,6 +117,12 @@ async def delete_menu_item(item_id: int) -> dict:
         item = await session.get(MenuItem, item_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Menu item not found")
+        used = await session.scalar(select(func.count()).select_from(OrderItem).where(OrderItem.item_id == item_id))
+        if used:
+            raise HTTPException(
+                status_code=409,
+                detail="This item appears in past orders, so it can't be deleted. Turn its availability off instead.",
+            )
         # Clear any lingering cart references so in-progress carts don't point at a deleted item.
         await session.execute(delete(CartItem).where(CartItem.item_id == item_id))
         await session.delete(item)
@@ -118,15 +131,12 @@ async def delete_menu_item(item_id: int) -> dict:
 
 
 @router.get("/api/staff/orders")
-async def list_orders() -> list[dict]:
+async def list_orders(limit: int = 200) -> list[dict]:
+    """Newest payment batches first. One query with eager loading (no per-order queries)."""
+    limit = max(1, min(limit, 500))
     async with async_session_factory() as session:
-        batches = []
-        result = await session.execute(select(PaymentBatch.id).order_by(PaymentBatch.id.desc()))
-        for batch_id in result.scalars():
-            batch = await order_service.get_batch(session, batch_id)
-            if batch:
-                batches.append(_batch(batch))
-        return batches
+        result = await session.execute(order_service._batch_query().order_by(PaymentBatch.id.desc()).limit(limit))
+        return [_batch(batch) for batch in result.scalars().all() if batch.orders]
 
 
 @router.get("/api/staff/orders/{batch_id}/receipt")
@@ -143,7 +153,13 @@ async def get_receipt(batch_id: int) -> Response:
             status_code=409,
             detail="Receipt previews aren't available in dry-run mode (no real image was uploaded).",
         )
-    content, mime_type = await whatsapp.download_media(media_id)
+    try:
+        content, mime_type = await whatsapp.download_media(media_id)
+    except Exception as exc:  # expired media id, expired token, network error
+        raise HTTPException(
+            status_code=502,
+            detail="Could not fetch the receipt from WhatsApp (it may have expired). Ask the customer to resend it.",
+        ) from exc
     if not content:
         raise HTTPException(status_code=502, detail="Could not fetch the receipt image from WhatsApp.")
     return Response(content=content, media_type=mime_type)
@@ -155,6 +171,11 @@ async def delete_order(batch_id: int) -> dict:
         batch = await order_service.get_batch(session, batch_id)
         if batch is None:
             raise HTTPException(status_code=404, detail="Payment batch not found")
+        if batch.status == OrderStatus.PAID:
+            raise HTTPException(
+                status_code=409,
+                detail="Paid orders are kept for your records and can't be deleted.",
+            )
         # Cascades to the batch's orders, order items, and fulfillment record.
         await session.delete(batch)
         await session.commit()
@@ -163,12 +184,78 @@ async def delete_order(batch_id: int) -> dict:
 
 @router.post("/api/staff/orders/{batch_id}/approve")
 async def approve_order(batch_id: int) -> dict:
-    return await _set_batch_status(batch_id, OrderStatus.PAID)
+    async with async_session_factory() as session:
+        batch = await _reviewable_batch(session, batch_id)
+        fulfillment = batch.fulfillment
+        batch.status = OrderStatus.PAID
+        low_stock: list[str] = []
+        for order in batch.orders:
+            order.status = OrderStatus.PAID
+            order.user.current_state = SessionState.COMPLETED
+            low_stock += await menu_service.decrement_stock(session, order)
+        if fulfillment is not None:
+            fulfillment.stage = FulfillmentStage.PREPARING
+            fulfillment.approved_at = datetime.now(timezone.utc)
+            fulfillment.timer_started_at = None
+        phone = batch.orders[0].user.phone_number
+        pickup = fulfillment is not None and fulfillment.fulfillment_type == "pickup"
+        await session.commit()  # save the decision first, then tell the customer
+        text = M11_APPROVED.format(batch=batch.id)
+        if pickup:
+            text = text.replace("as soon as it's on its way", "when it's ready for pickup")
+        await whatsapp.send_text(phone, text)
+        return {"status": "paid", "batch_id": batch.id, "low_stock": low_stock}
 
 
 @router.post("/api/staff/orders/{batch_id}/reject")
 async def reject_order(batch_id: int) -> dict:
-    return await _set_batch_status(batch_id, OrderStatus.CANCELLED)
+    """Reject a receipt. The customer can send a new one: the order is NOT cancelled."""
+    async with async_session_factory() as session:
+        batch = await _reviewable_batch(session, batch_id)
+        fulfillment = batch.fulfillment
+        user = batch.orders[0].user
+        phone = user.phone_number
+        if fulfillment is None:  # legacy order from before delivery tracking: reject = cancel
+            batch.status = OrderStatus.CANCELLED
+            for order in batch.orders:
+                order.status = OrderStatus.CANCELLED
+            user.current_state = SessionState.BROWSING
+            text = f"We couldn't verify payment batch #{batch.id}. Please contact us or send *menu* to try again."
+        else:
+            batch.receipt_media_id = None
+            fulfillment.stage = FulfillmentStage.AWAITING_PAYMENT
+            fulfillment.timer_started_at = datetime.now(timezone.utc)
+            fulfillment.reminders_sent = "[]"
+            fulfillment.address_editing = False
+            user.current_state = SessionState.AWAITING_PAYMENT
+            text = M12_REJECTED.format(
+                batch=batch.id, support_phone=settings.support_phone, minutes=settings.checkout_cancel_minutes,
+            )
+        await session.commit()
+        await whatsapp.send_text(phone, text)
+        return {"status": "receipt_rejected", "batch_id": batch.id}
+
+
+async def _reviewable_batch(session, batch_id: int) -> PaymentBatch:
+    """Load a batch that is genuinely waiting for approval; otherwise raise a clear HTTP error."""
+    batch = await order_service.get_batch(session, batch_id)
+    if batch is None or not batch.orders:
+        raise HTTPException(status_code=404, detail="Payment batch not found")
+    if batch.status != OrderStatus.PENDING:
+        raise HTTPException(status_code=409, detail="This order has already been handled")
+    fulfillment = batch.fulfillment
+    if fulfillment is not None:
+        if fulfillment.stage != FulfillmentStage.AWAITING_APPROVAL:
+            raise HTTPException(
+                status_code=409, detail="This order isn't waiting for approval (no receipt has been sent yet)."
+            )
+        if fulfillment.address_editing:
+            raise HTTPException(
+                status_code=409, detail="The customer is changing their delivery address. Try again in a minute."
+            )
+    elif not batch.receipt_media_id:
+        raise HTTPException(status_code=409, detail="No receipt has been sent for this order yet.")
+    return batch
 
 
 class QuoteInput(BaseModel):
@@ -191,13 +278,20 @@ async def quote_order(batch_id: int, payload: QuoteInput) -> dict:
         batch.delivery_fee = payload.fee
         batch.total_amount = subtotal + payload.fee
         fulfillment.stage = FulfillmentStage.AWAITING_FEE_ACCEPT
+        fulfillment.timer_started_at = datetime.now(timezone.utc)  # the customer gets a fresh window to reply
+        fulfillment.reminders_sent = "[]"
         user = batch.orders[0].user
         if user:
             user.current_state = SessionState.AWAITING_FEE_ACCEPT
-            await whatsapp.send_buttons(user.phone_number, M8C_QUOTE.format(
-                area=fulfillment.area_name, fee=naira(payload.fee), total=naira(batch.total_amount)
-            ), [("quote:accept", "Proceed to pay"), ("quote:cancel", "Cancel order")])
+        quote_text = M8C_QUOTE.format(
+            area=fulfillment.area_name, fee=naira(payload.fee), total=naira(batch.total_amount)
+        )
+        phone = user.phone_number if user else None
         await session.commit()
+        if phone:
+            await whatsapp.send_buttons(
+                phone, quote_text, [("quote:accept", "Proceed to pay"), ("quote:cancel", "Cancel order")]
+            )
         return _batch(await order_service.get_batch(session, batch_id))
 
 
@@ -214,19 +308,25 @@ async def mark_order_ready(batch_id: int) -> dict:
             raise HTTPException(status_code=409, detail="Order is not in the preparing stage")
         fulfillment.stage = FulfillmentStage.READY
         fulfillment.ready_at = datetime.now(timezone.utc)
-        if fulfillment.fulfillment_type == "pickup" and batch.orders:
-            user = batch.orders[0].user
-            if user:
-                await whatsapp.send_text(user.phone_number, f"Good news! Order #{batch.id} is ready for pickup at {settings.outlet_address}.")
+        pickup_phone = batch.orders[0].user.phone_number if fulfillment.fulfillment_type == "pickup" and batch.orders else None
         await session.commit()
+        if pickup_phone:
+            await whatsapp.send_text(pickup_phone, M16_PICKUP_READY.format(
+                batch=batch.id, outlet_address=settings.outlet_address, outlet_phone=settings.outlet_phone,
+            ))
         return {"status": "ready", "batch_id": batch.id}
 
 
 @router.post("/api/staff/orders/{batch_id}/dispatch")
 async def dispatch_order(batch_id: int, payload: DispatchInput) -> dict:
     async with async_session_factory() as session:
-        result = await state_machine.dispatch_fulfillment(session, batch_id, payload.rider_id)
-        await session.commit()
+        try:
+            result = await state_machine.dispatch_fulfillment(session, batch_id, payload.rider_id)
+        except state_machine.DispatchError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await session.commit()  # also saves dispatch_error when WhatsApp refused the message
+        if result["status"] == "failed":
+            raise HTTPException(status_code=502, detail=result["error"] + ". Check the rider's number and try Dispatch again.")
         return result
 
 
@@ -237,31 +337,40 @@ async def mark_order_collected(batch_id: int) -> dict:
         if batch is None or batch.fulfillment is None:
             raise HTTPException(status_code=404, detail="Fulfillment not found")
         fulfillment = batch.fulfillment
-        if fulfillment.stage not in {FulfillmentStage.READY, FulfillmentStage.OUT_FOR_DELIVERY}:
+        if fulfillment.fulfillment_type != "pickup":
+            raise HTTPException(status_code=409, detail="Only pickup orders can be marked as collected")
+        if fulfillment.stage != FulfillmentStage.READY:
             raise HTTPException(status_code=409, detail="Order is not ready to be marked collected")
         fulfillment.stage = FulfillmentStage.COLLECTED
         fulfillment.collected_at = datetime.now(timezone.utc)
-        if batch.orders:
-            user = batch.orders[0].user
-            if user:
-                await whatsapp.send_text(user.phone_number, f"Thank you for collecting order #{batch.id}. We appreciate you choosing {settings.brand_name}!")
+        phone = batch.orders[0].user.phone_number if batch.orders else None
         await session.commit()
+        if phone:
+            await whatsapp.send_buttons(
+                phone, M18B_COLLECTED.format(batch=batch.id, brand_name=settings.brand_name), [("menu", "Order again")]
+            )
         return {"status": "collected", "batch_id": batch.id}
 
 
 @router.post("/api/staff/orders/{batch_id}/reassign")
 async def reassign_order(batch_id: int, payload: DispatchInput) -> dict:
+    """Give a dispatched delivery (not yet picked up) to a different rider."""
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
         if batch is None or batch.fulfillment is None:
             raise HTTPException(status_code=404, detail="Fulfillment not found")
-        current_rider_id = batch.fulfillment.rider_id
-        if current_rider_id is not None and current_rider_id != payload.rider_id:
-            rider = await session.get(Rider, current_rider_id)
-            if rider:
-                await whatsapp.send_text(rider.phone_number, f"Delivery #{batch.id} was reassigned. No action needed from you.")
-        result = await state_machine.dispatch_fulfillment(session, batch_id, payload.rider_id, resend=True)
+        old_rider_id = batch.fulfillment.rider_id
+        try:
+            result = await state_machine.dispatch_fulfillment(session, batch_id, payload.rider_id, resend=True)
+        except state_machine.DispatchError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         await session.commit()
+        if result["status"] == "failed":
+            raise HTTPException(status_code=502, detail=result["error"] + ". The previous rider still has this delivery.")
+        if old_rider_id is not None and old_rider_id != payload.rider_id:
+            old_rider = await session.get(Rider, old_rider_id)
+            if old_rider is not None:
+                await whatsapp.send_text(old_rider.phone_number, R6_REASSIGNED.format(batch=batch_id))
         return result
 
 
@@ -269,53 +378,42 @@ async def reassign_order(batch_id: int, payload: DispatchInput) -> dict:
 async def mark_order_failed(batch_id: int, payload: FailureInput | None = None) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
-        if batch is None or batch.fulfillment is None:
+        if batch is None or batch.fulfillment is None or not batch.orders:
             raise HTTPException(status_code=404, detail="Fulfillment not found")
         fulfillment = batch.fulfillment
         if fulfillment.stage not in {FulfillmentStage.READY, FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY}:
             raise HTTPException(status_code=409, detail="Order is not eligible to be marked failed")
-        reason = (payload.reason if payload and payload.reason else fulfillment.failure_reasons or "Operational issue").strip()
-        fulfillment.stage = FulfillmentStage.FAILED
-        fulfillment.failed_at = datetime.now(timezone.utc)
-        fulfillment.failure_reasons = reason
-        fulfillment.failed_by = "staff"
-        batch.status = OrderStatus.CANCELLED
-        for order in batch.orders:
-            order.status = OrderStatus.CANCELLED
-        user = batch.orders[0].user if batch.orders else None
-        if user is not None:
-            await whatsapp.send_text(
-                user.phone_number,
-                M20_FAILED.format(
-                    batch=batch.id,
-                    items="items",
-                    reasons=reason,
-                    refund_timeframe=settings.refund_timeframe,
-                    support_phone=settings.support_phone,
-                ),
-            )
+        reason = (payload.reason if payload and payload.reason else "").strip() or "an operational problem"
+        await state_machine.fail_fulfillment(
+            session, batch, fulfillment, failed_by="staff", internal_reasons=reason, customer_reasons=reason,
+        )
         await session.commit()
         return {"status": "failed", "batch_id": batch.id, "reason": reason}
 
 
-@router.post("/api/staff/orders/{batch_id}/not-received")
-async def mark_order_not_received(batch_id: int) -> dict:
+@router.post("/api/staff/orders/{batch_id}/ack-failed")
+async def acknowledge_failed(batch_id: int) -> dict:
     async with async_session_factory() as session:
         batch = await order_service.get_batch(session, batch_id)
         if batch is None or batch.fulfillment is None:
             raise HTTPException(status_code=404, detail="Fulfillment not found")
-        fulfillment = batch.fulfillment
-        if fulfillment.stage not in {FulfillmentStage.DELIVERED, FulfillmentStage.FAILED}:
-            fulfillment.stage = FulfillmentStage.FAILED
-        fulfillment.not_received_at = datetime.now(timezone.utc)
-        fulfillment.not_received_acknowledged_at = datetime.now(timezone.utc)
-        fulfillment.failed_by = "customer"
-        fulfillment.failure_reasons = fulfillment.failure_reasons or "Customer reported order not received"
-        user = batch.orders[0].user if batch.orders else None
-        if user is not None:
-            await whatsapp.send_text(user.phone_number, M19_NOT_RECEIVED)
+        batch.fulfillment.failed_acknowledged_at = datetime.now(timezone.utc)
         await session.commit()
-        return {"status": "not_received", "batch_id": batch.id}
+        return {"status": "acknowledged", "batch_id": batch.id}
+
+
+@router.post("/api/staff/orders/{batch_id}/not-received")
+async def mark_order_not_received(batch_id: int) -> dict:
+    """Staff acknowledge a customer's "Didn't receive it?" report (the customer sends it from WhatsApp)."""
+    async with async_session_factory() as session:
+        batch = await order_service.get_batch(session, batch_id)
+        if batch is None or batch.fulfillment is None:
+            raise HTTPException(status_code=404, detail="Fulfillment not found")
+        if batch.fulfillment.not_received_at is None:
+            raise HTTPException(status_code=409, detail="The customer hasn't reported this order as not received")
+        batch.fulfillment.not_received_acknowledged_at = datetime.now(timezone.utc)
+        await session.commit()
+        return {"status": "acknowledged", "batch_id": batch.id}
 
 
 @router.get("/api/staff/riders")
@@ -339,7 +437,7 @@ async def create_rider(payload: RiderInput) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     async with async_session_factory() as session:
-        rider = Rider(name=payload.name.strip(), phone_number=phone, is_active=payload.is_active)
+        rider = Rider(name=payload.name.strip(), phone_number=phone, is_active=False)
         session.add(rider)
         try:
             await session.commit()
@@ -362,7 +460,7 @@ async def update_rider(rider_id: int, payload: RiderInput) -> dict:
             raise HTTPException(status_code=404, detail="Rider not found")
         rider.name = payload.name.strip()
         rider.phone_number = phone
-        rider.is_active = payload.is_active
+        # is_active is NOT editable here: a rider switches it himself by messaging ACTIVE / INACTIVE.
         try:
             await session.commit()
         except IntegrityError as exc:
@@ -378,6 +476,17 @@ async def archive_rider(rider_id: int) -> dict:
         rider = await session.get(Rider, rider_id)
         if rider is None:
             raise HTTPException(status_code=404, detail="Rider not found")
+        open_deliveries = await session.scalar(
+            select(func.count()).select_from(Fulfillment).where(
+                Fulfillment.rider_id == rider_id,
+                Fulfillment.stage.in_([FulfillmentStage.DISPATCHED, FulfillmentStage.OUT_FOR_DELIVERY]),
+            )
+        )
+        if open_deliveries:
+            raise HTTPException(
+                status_code=409,
+                detail="This rider still has deliveries in progress. Reassign or finish them first.",
+            )
         rider.is_archived = True
         rider.is_active = False
         await session.commit()
@@ -401,10 +510,14 @@ async def delete_rider(rider_id: int) -> dict:
         rider = await session.get(Rider, rider_id)
         if rider is None:
             raise HTTPException(status_code=404, detail="Rider not found")
-        # Detach the rider from any fulfillments referencing them before deleting.
-        await session.execute(
-            update(Fulfillment).where(Fulfillment.rider_id == rider_id).values(rider_id=None)
+        history = await session.scalar(
+            select(func.count()).select_from(Fulfillment).where(Fulfillment.rider_id == rider_id)
         )
+        if history:
+            raise HTTPException(
+                status_code=409,
+                detail="This rider has delivery history, so they can't be deleted. Archive them instead.",
+            )
         await session.delete(rider)
         await session.commit()
         return {"status": "deleted", "id": rider_id}
@@ -451,37 +564,6 @@ async def update_delivery_area(area_id: int, payload: DeliveryAreaInput) -> dict
         return _area(area)
 
 
-async def _set_batch_status(batch_id: int, status: OrderStatus) -> dict:
-    async with async_session_factory() as session:
-        batch = await order_service.get_batch(session, batch_id)
-        if batch is None:
-            raise HTTPException(status_code=404, detail="Payment batch not found")
-        if batch.status != OrderStatus.PENDING:
-            raise HTTPException(status_code=409, detail="Payment batch has already been handled")
-        batch.status = status
-        for order in batch.orders:
-            order.status = status
-            if status == OrderStatus.PAID:
-                order.user.current_state = SessionState.COMPLETED
-                await menu_service.decrement_stock(session, order)
-            else:
-                order.user.current_state = SessionState.BROWSING
-        if batch.fulfillment is not None:
-            if status == OrderStatus.PAID:
-                batch.fulfillment.stage = FulfillmentStage.PREPARING
-                batch.fulfillment.approved_at = datetime.now(timezone.utc)
-            else:
-                batch.fulfillment.stage = FulfillmentStage.CANCELLED
-                batch.fulfillment.cancelled_at = datetime.now(timezone.utc)
-        phone = batch.orders[0].user.phone_number
-        if status == OrderStatus.PAID:
-            await whatsapp.send_text(phone, f"Payment confirmed for batch #{batch.id}. Your orders are being prepared. Thank you!")
-        else:
-            await whatsapp.send_text(phone, f"We couldn't verify payment batch #{batch.id}. Please contact us or send *menu* to try again.")
-        await session.commit()
-        return {"status": status.value, "batch_id": batch.id}
-
-
 def _menu_item(item: MenuItem) -> dict:
     return {
         "id": item.id,
@@ -506,16 +588,32 @@ def _batch(batch) -> dict:
         "created_at": batch.created_at.isoformat() if batch.created_at else None,
         "customer": batch.orders[0].user.name or batch.orders[0].user.phone_number,
         "phone_number": batch.orders[0].user.phone_number,
+        "customer_id": batch.orders[0].user.id,
         "fulfillment": {
-            "type": fulfillment.fulfillment_type if fulfillment else None,
-            "stage": fulfillment.stage.value if fulfillment else None,
-            "rider_id": fulfillment.rider_id if fulfillment else None,
-            "rider_name": fulfillment.rider.name if fulfillment and fulfillment.rider else None,
-            "area_name": fulfillment.area_name if fulfillment else None,
-            "street": fulfillment.street if fulfillment else None,
-            "landmark": fulfillment.landmark if fulfillment else None,
-            "phone2": fulfillment.phone2 if fulfillment else None,
-            "notes": fulfillment.notes if fulfillment else None,
+            "type": fulfillment.fulfillment_type,
+            "stage": fulfillment.stage.value,
+            "rider_id": fulfillment.rider_id,
+            "rider_name": fulfillment.rider.name if fulfillment.rider else None,
+            "rider_phone": fulfillment.rider.phone_number if fulfillment.rider else None,
+            "area_name": fulfillment.area_name,
+            "street": fulfillment.street,
+            "landmark": fulfillment.landmark,
+            "phone2": fulfillment.phone2,
+            "notes": fulfillment.notes,
+            "map_link": state_machine.build_map_link(fulfillment) if fulfillment.fulfillment_type == "delivery" and fulfillment.street else None,
+            "expected_minutes": fulfillment.expected_minutes,
+            "address_editing": bool(fulfillment.address_editing),
+            "dispatch_error": fulfillment.dispatch_error,
+            "failure_reasons": fulfillment.failure_reasons,
+            "failed_acknowledged": fulfillment.failed_acknowledged_at is not None,
+            "not_received_at": fulfillment.not_received_at.isoformat() if fulfillment.not_received_at else None,
+            "not_received_acknowledged": fulfillment.not_received_acknowledged_at is not None,
+            "approved_at": fulfillment.approved_at.isoformat() if fulfillment.approved_at else None,
+            "dispatched_at": fulfillment.dispatched_at.isoformat() if fulfillment.dispatched_at else None,
+            "picked_up_at": fulfillment.picked_up_at.isoformat() if fulfillment.picked_up_at else None,
+            "delivered_at": fulfillment.delivered_at.isoformat() if fulfillment.delivered_at else None,
+            "collected_at": fulfillment.collected_at.isoformat() if fulfillment.collected_at else None,
+            "failed_at": fulfillment.failed_at.isoformat() if fulfillment.failed_at else None,
         } if fulfillment else None,
         "orders": [
             {
