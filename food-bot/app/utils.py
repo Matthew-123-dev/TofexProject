@@ -18,3 +18,9 @@ def normalize_phone(phone: str) -> str:
     if not re.fullmatch(r"234[789]\d{9}", digits):
         raise ValueError("Enter a valid Nigerian mobile number.")
     return digits
+
+
+def fake_whatsapp_function(to: str, body: str) -> bool:
+    """Fake WhatsApp function to simulate sending a message."""
+    # Simulate sending a message and return True if successful
+    return True
