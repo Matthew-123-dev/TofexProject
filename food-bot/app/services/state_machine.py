@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 GREETINGS = {"menu", "hi", "hello", "hey", "start"}
 MENU_PAGE_SIZE = 10
+CATEGORY_PAGE_SIZE = 9
 QUANTITY_PAGE_SIZE = 10
 MAX_RECEIPT_BYTES = 5 * 1024 * 1024
 
@@ -141,6 +142,12 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     if rid.startswith("notreceived:"):
         batch_text = rid.removeprefix("notreceived:")
         return await handle_not_received(session, user, int(batch_text) if batch_text.isdigit() else 0)
+    if rid.startswith("menupg:"):
+        menu_page_text = rid.removeprefix("menupg:")
+        if not menu_page_text.isdigit():
+            await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
+            return
+        return await handle_menu_request(session, user, int(menu_page_text))
     if rid.startswith("catpg:"):
         category_page = rid.removeprefix("catpg:")
         if ":" not in category_page:
@@ -466,13 +473,19 @@ async def handle_rider_message(session: AsyncSession, rider: Rider, msg: Incomin
     await whatsapp.send_text(rider.phone_number, R5_HELP)
 
 
-async def handle_menu_request(session: AsyncSession, user: User) -> None:
+async def handle_menu_request(session: AsyncSession, user: User, page: int = 0) -> None:
     user.current_state = SessionState.BROWSING
     categories = await menu_service.get_categories(session)
     if not categories:
         await whatsapp.send_text(user.phone_number, "Sorry, nothing is available right now. Please check back soon.")
         return
-    rows = [{"id": f"cat:{c}", "title": c[:24]} for c in categories]
+    # A WhatsApp list holds at most 10 rows: 9 categories + 1 "More categories" row.
+    total_pages = (len(categories) + CATEGORY_PAGE_SIZE - 1) // CATEGORY_PAGE_SIZE
+    page = min(max(page, 0), total_pages - 1)
+    start = page * CATEGORY_PAGE_SIZE
+    rows = [{"id": f"cat:{c}", "title": c[:24]} for c in categories[start:start + CATEGORY_PAGE_SIZE]]
+    if start + CATEGORY_PAGE_SIZE < len(categories):
+        rows.append({"id": f"menupg:{page + 1}", "title": "More categories"})
     await whatsapp.send_list(user.phone_number, "What would you like to order?", "View menu", "Categories", rows)
 
 

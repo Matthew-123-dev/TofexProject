@@ -281,6 +281,7 @@ async def _reviewable_batch(session, batch_id: int) -> PaymentBatch:
 
 class QuoteInput(BaseModel):
     fee: Decimal = Field(ge=0)
+    expected_minutes: int = Field(ge=1, le=1440)
 
 
 @router.post("/api/staff/orders/{batch_id}/quote")
@@ -298,6 +299,7 @@ async def quote_order(batch_id: int, payload: QuoteInput) -> dict:
         subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
         batch.delivery_fee = payload.fee
         batch.total_amount = subtotal + payload.fee
+        fulfillment.expected_minutes = payload.expected_minutes
         fulfillment.stage = FulfillmentStage.AWAITING_FEE_ACCEPT
         fulfillment.timer_started_at = datetime.now(timezone.utc)  # the customer gets a fresh window to reply
         fulfillment.reminders_sent = "[]"
