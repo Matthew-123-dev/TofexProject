@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
 from app import models
-from app.services import menu_service
+from app.services import menu_service, whatsapp
 
 class DispatchError(ValueError):
     pass
@@ -60,16 +60,15 @@ async def handle_incoming(session: AsyncSession, msg: models.IncomingMessage) ->
     elif msg.text.startswith("confirm"):
         await confirm_address(session, user, fulfillment=None)
     elif msg.text.startswith("send"):
-        await send_location_request(session, user)
+        await whatsapp.send_location_request(session, user)
     elif msg.text.startswith("sendtext"):
-        await send_text(to=user.phone, body="Hello, this is a test message.")
+        await whatsapp.send_text(to=user.phone, body="Hello, this is a test message.")
     elif msg.text.startswith("sendbuttons"):
-        await send_buttons(to=user.phone, body="Hello, this is a test message.", buttons=[("Button 1", "action1"), ("Button 2", "action2")])
+        await whatsapp.send_buttons(to=user.phone, body="Hello, this is a test message.", buttons=[("Button 1", "action1"), ("Button 2", "action2")])
     elif msg.text.startswith("sendlist"):
-        await send_list(to=user.phone, body="Hello, this is a test message.", button_label="Button", section_title="Section", rows=[{"title": "Row 1", "description": "Description 1"}, {"title": "Row 2", "description": "Description 2"}])
+        await whatsapp.send_list(to=user.phone, body="Hello, this is a test message.", button_label="Button", section_title="Section", rows=[{"title": "Row 1", "description": "Description 1"}, {"title": "Row 2", "description": "Description 2"}])
     elif msg.text.startswith("download"):
-        media_id = msg.text[8:]
-        await download_media(media_id)
+        await whatsapp.download_media(media_id)
     elif msg.text.startswith("simulate"):
         await simulate(session, user)
 
