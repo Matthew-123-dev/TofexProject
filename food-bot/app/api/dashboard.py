@@ -22,6 +22,7 @@ from app.models import (
     OrderItem,
     OrderStatus,
     PaymentBatch,
+    ReceiptImage,
     Rider,
     SessionState,
 )
@@ -35,6 +36,10 @@ async def require_staff(request: Request) -> None:
 
 router = APIRouter(tags=["dashboard"], dependencies=[Depends(require_staff)])
 HTML_PATH = Path(__file__).resolve().parents[1] / "dashboard.html"
+RECEIPT_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "private, max-age=3600",
+}
 
 
 class MenuItemInput(BaseModel):
@@ -145,6 +150,19 @@ async def get_receipt(batch_id: int) -> Response:
         batch = await order_service.get_batch(session, batch_id)
         if batch is None:
             raise HTTPException(status_code=404, detail="Payment batch not found")
+        stored = (
+            await session.execute(
+                select(ReceiptImage)
+                .where(ReceiptImage.payment_batch_id == batch_id)
+                .order_by(ReceiptImage.created_at.desc(), ReceiptImage.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if stored is not None:
+            mime_clean = (stored.mime_type or "").strip().lower()
+            if not mime_clean.startswith("image/"):
+                raise HTTPException(status_code=415, detail="Stored receipt is not a valid image.")
+            return Response(content=stored.content, media_type=mime_clean, headers=RECEIPT_HEADERS)
         if not batch.receipt_media_id:
             raise HTTPException(status_code=404, detail="No receipt has been uploaded for this order")
         media_id = batch.receipt_media_id
@@ -162,7 +180,10 @@ async def get_receipt(batch_id: int) -> Response:
         ) from exc
     if not content:
         raise HTTPException(status_code=502, detail="Could not fetch the receipt image from WhatsApp.")
-    return Response(content=content, media_type=mime_type)
+    mime_clean = (mime_type or "").strip().lower()
+    if not mime_clean.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Receipt media is not a valid image.")
+    return Response(content=content, media_type=mime_clean, headers=RECEIPT_HEADERS)
 
 
 @router.delete("/api/staff/orders/{batch_id}")

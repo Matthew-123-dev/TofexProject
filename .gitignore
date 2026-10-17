@@ -1,2 +1,3 @@
 # Local database created outside the application directory
 /foodbot.db
+.aider*

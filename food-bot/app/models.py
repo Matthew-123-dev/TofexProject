@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func,
+    Boolean, DateTime, Enum, ForeignKey, Integer, LargeBinary, Numeric, String, Text, UniqueConstraint, func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -128,6 +128,20 @@ class PaymentBatch(Base):
     fulfillment: Mapped["Fulfillment | None"] = relationship(
         back_populates="payment_batch", uselist=False, cascade="all, delete-orphan"
     )
+
+
+class ReceiptImage(Base):
+    __tablename__ = "receipt_images"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_batch_id: Mapped[int] = mapped_column(
+        ForeignKey("payment_batches.id", ondelete="CASCADE"), index=True
+    )
+    media_id: Mapped[str] = mapped_column(String(200))
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    mime_type: Mapped[str] = mapped_column(String(100))
+    size_bytes: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
 
 
 class Order(Base):

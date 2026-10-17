@@ -10,7 +10,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models import (
-    Cart, DeliveryArea, Fulfillment, FulfillmentStage, MenuItem, OrderStatus, PaymentBatch, Rider, SessionState, User,
+    Cart,
+    DeliveryArea,
+    Fulfillment,
+    FulfillmentStage,
+    MenuItem,
+    OrderStatus,
+    PaymentBatch,
+    ReceiptImage,
+    Rider,
+    SavedAddress,
+    SessionState,
+    User,
 )
 from app.messages import (
     M1_CHOICE, M2_STREET, M3_AREA, M3B_OTHER_AREA, M4_PIN, M5_LANDMARK, M6_SECOND_PHONE, M7_NOTES,
@@ -27,6 +38,7 @@ logger = logging.getLogger(__name__)
 GREETINGS = {"menu", "hi", "hello", "hey", "start"}
 MENU_PAGE_SIZE = 10
 QUANTITY_PAGE_SIZE = 10
+MAX_RECEIPT_BYTES = 5 * 1024 * 1024
 
 # While a customer is in these stages the conversation belongs to the checkout:
 # the only way out is `cancel`.
@@ -789,6 +801,34 @@ async def handle_checkout_flow(
     if stage == FulfillmentStage.AWAITING_PAYMENT:
         if msg.type == "image" and msg.media_id:
             batch.receipt_media_id = msg.media_id
+            try:
+                content, mime = await whatsapp.download_media(msg.media_id)
+                mime_clean = (mime or "").strip().lower()
+                if content and len(content) <= MAX_RECEIPT_BYTES and mime_clean.startswith("image/"):
+                    session.add(
+                        ReceiptImage(
+                            payment_batch_id=batch.id,
+                            media_id=msg.media_id,
+                            content=content,
+                            mime_type=mime_clean[:100],
+                            size_bytes=len(content),
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Receipt media %s for batch %s not stored (size=%s, mime=%r)",
+                        msg.media_id,
+                        batch.id,
+                        len(content) if content else 0,
+                        mime,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not download receipt media %s for batch %s",
+                    msg.media_id,
+                    batch.id,
+                    exc_info=True,
+                )
             fulfillment.stage = FulfillmentStage.AWAITING_APPROVAL
             fulfillment.timer_started_at = None  # the customer has paid; from here only staff can act
             user.current_state = SessionState.AWAITING_APPROVAL
@@ -813,6 +853,64 @@ async def handle_checkout_flow(
     await process_address_step(session, user, fulfillment, msg)
 
 
+async def _active_saved_address(
+    session: AsyncSession, user_id: int
+) -> tuple[SavedAddress | None, DeliveryArea | None]:
+    """Load the user's SavedAddress explicitly and verify its DeliveryArea is still active."""
+    saved = (
+        await session.execute(select(SavedAddress).where(SavedAddress.user_id == user_id))
+    ).scalar_one_or_none()
+    if saved is None or saved.area_id is None:
+        return None, None
+    area = await session.get(DeliveryArea, saved.area_id)
+    if area is None or not area.is_active:
+        return None, None
+    return saved, area
+
+
+async def _send_saved_address_prompt(user: User, saved: SavedAddress, area: DeliveryArea) -> None:
+    await whatsapp.send_buttons(
+        user.phone_number,
+        f"Deliver to your saved address?\n\n📍 {saved.street}, {area.name}\nLandmark: {saved.landmark}",
+        [("saved:use", "Use this address"), ("saved:new", "New address")],
+    )
+
+
+async def save_address(session: AsyncSession, user: User, fulfillment: Fulfillment) -> None:
+    """Insert or update the customer's single SavedAddress row from a confirmed delivery fulfillment."""
+    if fulfillment.fulfillment_type != "delivery" or not fulfillment.street:
+        return
+    saved = (
+        await session.execute(select(SavedAddress).where(SavedAddress.user_id == user.id))
+    ).scalar_one_or_none()
+    area_name = fulfillment.area_name or ""
+    landmark = fulfillment.landmark or ""
+    if saved is None:
+        session.add(
+            SavedAddress(
+                user_id=user.id,
+                street=fulfillment.street,
+                area_id=fulfillment.area_id,
+                area_name=area_name,
+                landmark=landmark,
+                phone2=fulfillment.phone2,
+                notes=fulfillment.notes,
+                latitude=fulfillment.latitude,
+                longitude=fulfillment.longitude,
+            )
+        )
+    else:
+        saved.street = fulfillment.street
+        saved.area_id = fulfillment.area_id
+        saved.area_name = area_name
+        saved.landmark = landmark
+        saved.phone2 = fulfillment.phone2
+        saved.notes = fulfillment.notes
+        saved.latitude = fulfillment.latitude
+        saved.longitude = fulfillment.longitude
+    await session.flush()
+
+
 async def process_address_step(
     session: AsyncSession, user: User, fulfillment: Fulfillment, msg: IncomingMessage
 ) -> None:
@@ -831,12 +929,42 @@ async def process_address_step(
                 await send_payment_message(user, batch, fulfillment)
         elif msg.reply_id == "fulfillment:delivery":
             fulfillment.fulfillment_type = "delivery"
-            fulfillment.checkout_step = "area"
-            await send_area_page(session, user, fulfillment, 0)
+            saved, area = await _active_saved_address(session, user.id)
+            if saved is not None and area is not None:
+                fulfillment.checkout_step = "saved_choice"
+                await _send_saved_address_prompt(user, saved, area)
+            else:
+                fulfillment.checkout_step = "area"
+                await send_area_page(session, user, fulfillment, 0)
         else:
             await whatsapp.send_buttons(user.phone_number, M1_CHOICE, [
                 ("fulfillment:delivery", "Delivery"), ("fulfillment:pickup", "Pickup"), ("cancel", "Cancel order")
             ])
+        return
+
+    if step == "saved_choice":
+        if msg.reply_id == "saved:new":
+            fulfillment.checkout_step = "area"
+            await send_area_page(session, user, fulfillment, 0)
+            return
+        saved, area = await _active_saved_address(session, user.id)
+        if saved is None or area is None:
+            fulfillment.checkout_step = "area"
+            await send_area_page(session, user, fulfillment, 0)
+            return
+        if msg.reply_id == "saved:use":
+            fulfillment.street = saved.street
+            fulfillment.area_id = area.id
+            fulfillment.area_name = area.name
+            fulfillment.landmark = saved.landmark
+            fulfillment.phone2 = saved.phone2
+            fulfillment.notes = saved.notes
+            fulfillment.latitude = saved.latitude
+            fulfillment.longitude = saved.longitude
+            fulfillment.expected_minutes = area.expected_minutes
+            await confirm_address(session, user, fulfillment)
+            return
+        await _send_saved_address_prompt(user, saved, area)
         return
 
     if step == "area":
@@ -1003,10 +1131,17 @@ async def send_summary(session: AsyncSession, user: User, fulfillment: Fulfillme
         fee_text, total_text = "to be confirmed", f"{naira(subtotal)} + delivery fee"
     body = M8_SUMMARY.format(
         street=fulfillment.street, area=fulfillment.area_name, landmark=fulfillment.landmark,
-        second_phone_line=f"Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else "",
+        second_phone_line=f"Second phone: {fulfillment.phone2}\n" if fulfillment.notes or fulfillment.phone2 else "",
         notes_line=f"Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
         subtotal=naira(subtotal), fee=fee_text, total=total_text,
     )
+    if not fulfillment.phone2:
+        body = M8_SUMMARY.format(
+            street=fulfillment.street, area=fulfillment.area_name, landmark=fulfillment.landmark,
+            second_phone_line="",
+            notes_line=f"Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
+            subtotal=naira(subtotal), fee=fee_text, total=total_text,
+        )
     await whatsapp.send_buttons(user.phone_number, body, [("address:confirm", "Confirm"), ("address:edit", "Edit")])
 
 
@@ -1023,6 +1158,7 @@ async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfil
         fulfillment.address_editing = False
         fulfillment.address_edit_started_at = None
         fulfillment.checkout_step = None
+        await save_address(session, user, fulfillment)
         user.current_state = (
             SessionState.AWAITING_APPROVAL if fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL
             else SessionState.AWAITING_PAYMENT
@@ -1030,6 +1166,7 @@ async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfil
         await whatsapp.send_text(user.phone_number, "Your delivery address has been updated ✅")
         return
 
+    await save_address(session, user, fulfillment)
     area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
     if area:
         batch.delivery_fee = area.fee
@@ -1107,7 +1244,7 @@ async def dispatch_fulfillment(session: AsyncSession, batch_id: int, rider_id: i
     )
     sent = await whatsapp.send_buttons(
         rider.phone_number, rider_message,
-        [(f"r:picked:{batch.id}", "Picked up"), (f"r:fail:{batch.id}", "Can't deliver")],
+        [(f"r:picked:{batch.id}", "Picked up"), (f"r:fail:{batch_id}", "Can't deliver")],
     )
     if not sent:
         fulfillment.dispatch_error = "WhatsApp could not deliver the message to the rider"

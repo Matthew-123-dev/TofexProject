@@ -1,8 +1,11 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import AsyncSession                                                                                                     
+from sqlalchemy.orm import sessionmaker                                                                                                             
+from sqlalchemy import create_engine        
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.responses import RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -10,6 +13,12 @@ from starlette.middleware.sessions import SessionMiddleware
 from app.api import auth, dashboard, dev, health, webhook_whatsapp
 from app.config import settings
 from app.services.scheduler import run_scheduler
+from app.database import Base, get_session, async_session_factory
+
+# Dependency to get a database session                                                                                                              
+async def get_db() -> AsyncSession:                                                                                                                 
+    async with async_session_factory() as session:                                                                                                          
+        yield session   
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
