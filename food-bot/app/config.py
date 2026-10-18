@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     brand_name: str = "Tofex Grill and More"
     outlet_address: str = "[Outlet address - to be added]"
     outlet_phone: str = "[Outlet phone - to be added]"
-    support_phone: str = "[Support phone - to be added]"
+    support_phone: str = "+2348129579867"
     refund_timeframe: str = "[timeframe - to be added]"
     maps_region_hint: str = "Lagos, Nigeria"
     checkout_reminder_minutes: int = 10
