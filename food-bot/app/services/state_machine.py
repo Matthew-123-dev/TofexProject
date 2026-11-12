@@ -934,7 +934,7 @@ async def handle_add_item(
             ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
             ("cat:Protein 2", "🍗 Add Grilled Chicken"),
             ("cat:Protein 3", "🦃 Add Grilled Turkey"),
-            ("cat:Protein 1", "🥩 Add Beef, Fish or Salad"),
+            ("cat:Protein 1", "🥩 Add Beef, Fish, Plantain or Extras"),
             ("cat:Drinks", "🥤 Add a Cold Drink"),
             ("menu", "🍛 Add another meal or snack"),
             ("carts", "🛒 View / Edit cart"),

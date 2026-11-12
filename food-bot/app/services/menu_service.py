@@ -1,10 +1,13 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MenuItem, Order
+
+# Items moved from 'Food' to 'Protein 1' (Beef, Fish, Plantain & Extras) even on already-seeded DBs
+EXTRAS_MOVED_FROM_FOOD: set[str] = {"Plantain (1)", "Moimoi"}
 
 # Customer-facing category labels (Principle 3: Recognition over recall)
 CATEGORY_DISPLAY_NAMES: dict[str, str] = {
@@ -12,7 +15,7 @@ CATEGORY_DISPLAY_NAMES: dict[str, str] = {
     "Snacks": "🌯 Shawarma & Snacks",
     "Protein 2": "🍗 Grilled Chicken",
     "Protein 3": "🦃 Grilled Turkey",
-    "Protein 1": "🥩 Beef, Fish & Extras",
+    "Protein 1": "🥩 Beef, Fish, Plantain & Extras",
     "Drinks": "🥤 Cold Drinks",
     "Icecream": "🍦 Ice Cream",
 }
@@ -50,11 +53,11 @@ ITEM_DISPLAY_NAMES: dict[str, str] = {
 
 # Popularity order per category so the most popular items appear first in each poll
 ITEM_POPULARITY_ORDER: dict[str, list[str]] = {
-    "Food": ["Jollof rice", "Fried rice", "Spaghetti", "Porridge", "Moimoi", "Plantain (1)"],
+    "Food": ["Jollof rice", "Fried rice", "Spaghetti", "Porridge"],
     "Snacks": ["Shawama (1200)", "Shawama (2000)", "Meatpie", "Eggroll", "Popcorn (200)", "Popcorn (300)"],
     "Protein 2": ["Chicken (1)", "Chicken (2)", "Chicken (3)", "Chicken (4)", "Chicken (5)"],
     "Protein 3": ["Turkey (1)", "Turkey (2)", "Turkey (3)", "Turkey (4)", "Turkey (5)"],
-    "Protein 1": ["Beef", "Fish (Medium)", "Fish (Big)", "Salad", "Egg", "Ponmo"],
+    "Protein 1": ["Beef", "Plantain (1)", "Egg", "Moimoi", "Salad", "Fish (Medium)", "Fish (Big)", "Ponmo"],
     "Drinks": [
         "Coke",
         "Fanta",
@@ -106,11 +109,35 @@ async def get_categories(session: AsyncSession) -> list[str]:
 
 
 async def get_available_items(session: AsyncSession, category: str) -> list[MenuItem]:
-    result = await session.execute(
-        select(MenuItem)
-        .where(MenuItem.category == category, MenuItem.is_available.is_(True))
-        .order_by(MenuItem.name)
-    )
+    if category == "Food":
+        stmt = (
+            select(MenuItem)
+            .where(
+                MenuItem.category == "Food",
+                MenuItem.is_available.is_(True),
+                MenuItem.name.not_in(EXTRAS_MOVED_FROM_FOOD),
+            )
+            .order_by(MenuItem.name)
+        )
+    elif category == "Protein 1":
+        stmt = (
+            select(MenuItem)
+            .where(
+                MenuItem.is_available.is_(True),
+                or_(
+                    MenuItem.category == "Protein 1",
+                    MenuItem.name.in_(EXTRAS_MOVED_FROM_FOOD),
+                ),
+            )
+            .order_by(MenuItem.name)
+        )
+    else:
+        stmt = (
+            select(MenuItem)
+            .where(MenuItem.category == category, MenuItem.is_available.is_(True))
+            .order_by(MenuItem.name)
+        )
+    result = await session.execute(stmt)
     items = list(result.scalars())
     pop_list = ITEM_POPULARITY_ORDER.get(category)
     if not pop_list:

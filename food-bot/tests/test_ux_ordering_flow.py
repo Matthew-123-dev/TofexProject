@@ -44,7 +44,27 @@ async def test_ux_step1_friendly_categories_and_single_poll_pagination(db, user)
     assert step1_rows[3]["id"] == "cat:Protein 3"
     assert step1_rows[3]["title"] == "🦃 Grilled Turkey"
     assert step1_rows[4]["id"] == "cat:Protein 1"
-    assert step1_rows[4]["title"] == "🥩 Beef, Fish & Extras"
+    assert step1_rows[4]["title"] == "🥩 Beef, Fish, Plantain & Extras"
+
+    # Verify Food ("🍛 Rice, Spaghetti & Porridge") contains only the 4 main meals (no Plantain/Moimoi)
+    whatsapp.send_list.reset_mock()
+    await state_machine.handle_incoming(
+        db, IncomingMessage(id="ux-food", sender=user.phone_number, type="interactive", reply_id="cat:Food")
+    )
+    food_rows = whatsapp.send_list.call_args[0][4]
+    food_titles = [r["title"] for r in food_rows if r["id"].startswith("add:")]
+    assert food_titles == ["Jollof rice", "Fried rice", "Spaghetti", "Porridge"]
+
+    # Verify Protein 1 ("🥩 Beef, Fish, Plantain & Extras") surfaces Plantain and Moimoi on Page 1 alongside Beef/Egg/Salad
+    whatsapp.send_list.reset_mock()
+    await state_machine.handle_incoming(
+        db, IncomingMessage(id="ux-prot1", sender=user.phone_number, type="interactive", reply_id="cat:Protein 1")
+    )
+    prot1_rows = whatsapp.send_list.call_args[0][4]
+    prot1_titles = [r["title"] for r in prot1_rows if r["id"].startswith("add:")]
+    assert "Plantain (1 portion)" in prot1_titles
+    assert "Moimoi" in prot1_titles
+    assert "Beef" in prot1_titles
 
     # Step 2: Multi-page category (Drinks has 19 items) sends ONLY ONE poll per turn (never send_buttons after send_list)
     whatsapp.send_list.reset_mock()
