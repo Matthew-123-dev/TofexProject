@@ -371,8 +371,40 @@ async def _send_evolution_poll_or_text(to: str, body: str, poll_values: list[str
     )
 
 
+def _format_meta_row(row_id: str, raw_title: str, raw_desc: str = "") -> dict:
+    """Format a row for Meta Cloud API's strict 24-char title and 72-char description limits."""
+    title = (raw_title or "").strip()
+    desc = (raw_desc or "").strip()
+
+    if len(title) > 24:
+        overflow = ""
+        if " — " in title:
+            head, tail = title.split(" — ", 1)
+            if 1 <= len(head.strip()) <= 24:
+                title, overflow = head.strip(), tail.strip()
+        if not overflow and " (" in title:
+            head, tail = title.split(" (", 1)
+            if 1 <= len(head.strip()) <= 24:
+                title, overflow = head.strip(), f"({tail.strip()}"
+        if not overflow:
+            cut = title[:24]
+            last_space = cut.rfind(" ")
+            if last_space >= 10:
+                overflow = title
+                title = cut[:last_space].rstrip(" ,&·-")
+            else:
+                overflow = title
+                title = cut
+        desc = f"{overflow} · {desc}" if (overflow and desc) else (overflow or desc)
+
+    out: dict[str, str] = {"id": str(row_id), "title": title[:24]}
+    if desc:
+        out["description"] = desc[:72]
+    return out
+
+
 async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bool:
-    """Reply buttons: WhatsApp allows at most 3 on Meta, or a 1-tap Poll on Evolution API."""
+    """Reply buttons: up to 3 reply buttons on Meta (auto-upgraded to a Meta List when >3), or a 1-tap Poll on Evolution API."""
     sliced_buttons = [(i, t[:20]) for i, t in buttons[:3]]
     poll_options = [(i, t) for i, t in buttons]
     poll_values = _populate_menu_map(to, poll_options, kind="buttons")
@@ -391,6 +423,20 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
         })
     if _is_evolution():
         return await _send_evolution_poll_or_text(to, body, poll_values)
+    if len(buttons) > 3:
+        meta_rows = [_format_meta_row(i, t) for i, t in buttons[:10]]
+        return await _send({
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": {"text": body[:1024]},
+                "action": {
+                    "button": "Choose option",
+                    "sections": [{"title": "Options", "rows": meta_rows}],
+                },
+            },
+        })
     return await _send({
         "to": to,
         "type": "interactive",
@@ -407,7 +453,7 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
 async def send_list(to: str, body: str, button_label: str, section_title: str, rows: list[dict]) -> bool:
     """List message: up to 10 rows on Meta, or a 1-tap Poll on Evolution API."""
     sliced_rows = [
-        {"id": r["id"], "title": str(r["title"])[:24], **({"description": r["description"]} if r.get("description") else {})}
+        _format_meta_row(str(r["id"]), str(r["title"]), str(r.get("description") or ""))
         for r in rows[:10]
     ]
     poll_rows = rows if _is_evolution() else sliced_rows
@@ -785,6 +831,10 @@ def parse_incoming(payload: dict) -> list[IncomingMessage]:
                 latitude = longitude = location_name = location_address = None
                 if mtype == "text":
                     text = m["text"]["body"]
+                    resolved_id = resolve_menu_selection(m.get("from", ""), text)
+                    if resolved_id is not None:
+                        mtype = "interactive"
+                        reply_id = resolved_id
                 elif mtype == "interactive":
                     inter = m["interactive"]
                     reply_id = inter.get(inter.get("type", ""), {}).get("id")

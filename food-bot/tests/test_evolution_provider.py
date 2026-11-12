@@ -245,6 +245,63 @@ async def test_meta_outbound_kept_intact(monkeypatch):
     assert calls[-1]["json"]["type"] == "interactive"
     assert calls[-1]["json"]["interactive"]["type"] == "button"
 
+    # >3 buttons on Meta automatically upgrades to a Meta List message so escape routes (Go back / Cancel) are kept
+    assert await whatsapp.send_buttons(
+        phone,
+        "Step 6 of 6: Confirm your order",
+        [
+            ("checkout", "🚫 No extras — Checkout (₦4,800)"),
+            ("address:edit", "📍 Edit delivery / pickup"),
+            ("checkout:edit_items", "🛒 Edit items in cart"),
+            ("nav:back", "⬅ Go back"),
+            ("cancel", "❌ Cancel order"),
+        ],
+    ) is True
+    meta_inter = calls[-1]["json"]["interactive"]
+    assert meta_inter["type"] == "list"
+    meta_rows = meta_inter["action"]["sections"][0]["rows"]
+    assert len(meta_rows) == 5
+    assert all(len(r["title"]) <= 24 for r in meta_rows)
+    assert meta_rows[0]["id"] == "checkout"
+    assert meta_rows[0]["title"] == "🚫 No extras"
+    assert meta_rows[0]["description"] == "Checkout (₦4,800)"
+    assert meta_rows[3]["id"] == "nav:back"
+    assert meta_rows[4]["id"] == "cancel"
+
+    # >24-char row titles in send_list split cleanly on Meta into <=24-char title + <=72-char description
+    assert await whatsapp.send_list(
+        phone,
+        "Step 1 of 6: Pick a category",
+        "View menu",
+        "Categories",
+        [{"id": "cat:Food", "title": "🍛 Rice, Spaghetti & Porridge"}],
+    ) is True
+    list_rows = calls[-1]["json"]["interactive"]["action"]["sections"][0]["rows"]
+    assert len(list_rows[0]["title"]) <= 24
+    assert list_rows[0]["title"] == "🍛 Rice, Spaghetti"
+    assert list_rows[0]["description"] == "🍛 Rice, Spaghetti & Porridge"
+
+    # Meta inbound text messages ("1") resolve against LAST_MENU_MAP
+    meta_webhook = {
+        "entry": [
+            {
+                "changes": [
+                    {
+                        "value": {
+                            "messages": [
+                                {"id": "wamid.meta.1", "from": phone, "type": "text", "text": {"body": "1"}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+    parsed_meta = whatsapp.parse_incoming(meta_webhook)
+    assert len(parsed_meta) == 1
+    assert parsed_meta[0].type == "interactive"
+    assert parsed_meta[0].reply_id == "cat:Food"
+
 
 @pytest.mark.asyncio
 async def test_inbound_evolution_filtering_dedup_and_resolution(client, db, user, menu_item, delivery_area, monkeypatch):
