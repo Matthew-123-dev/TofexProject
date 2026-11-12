@@ -157,6 +157,16 @@ def _ensure_poll_options(options: list[tuple[str, str]]) -> list[tuple[str, str]
     return [(first_id, first_title), second]
 
 
+def _clear_numeric_shortcuts(to: str) -> None:
+    """Remove bare number shortcuts ('1', '2', ...) when a plain-text prompt is sent."""
+    phone = _clean_phone(to)
+    menu = LAST_MENU_MAP.get(phone)
+    if menu:
+        for k in [k for k in list(menu.keys()) if k.isdigit()]:
+            menu.pop(k, None)
+    _LAST_MENU_KIND[phone] = "text"
+
+
 def _populate_menu_map(
     to: str,
     options: list[tuple[str, str]],
@@ -168,12 +178,19 @@ def _populate_menu_map(
     phone = _clean_phone(to)
     mapping = _CaseInsensitiveMenuMap()
 
+    follows_list = kind == "buttons" and _LAST_MENU_KIND.get(phone) == "list" and phone in LAST_MENU_MAP
+    is_pagination_buttons = follows_list and bool(options) and all(
+        opt_id == "menu" or opt_id.startswith("catpg:") for opt_id, _ in options
+    )
+
     # When send_list is immediately followed by send_buttons in the same turn
     # (e.g. show_carts or multi-page category browsing), retain non-numeric title
     # keys from the list so tapping an option on either poll resolves cleanly.
-    if kind == "buttons" and _LAST_MENU_KIND.get(phone) == "list" and phone in LAST_MENU_MAP:
+    # For pagination buttons (Previous / Categories / Next), also preserve the
+    # list's numeric keys ("1".."10") so typing an item number still adds that item.
+    if follows_list:
         for existing_key, existing_val in LAST_MENU_MAP[phone].items():
-            if not existing_key.isdigit():
+            if not existing_key.isdigit() or is_pagination_buttons:
                 mapping[existing_key] = existing_val
 
     effective_options = _ensure_poll_options(options)
@@ -183,7 +200,8 @@ def _populate_menu_map(
         numbered = f"{idx}. {title}"
         poll_values.append(numbered)
 
-        mapping[str(idx)] = opt_id
+        if not is_pagination_buttons:
+            mapping[str(idx)] = opt_id
         mapping[numbered] = opt_id
         mapping[numbered.lower()] = opt_id
         mapping[title] = opt_id
@@ -282,6 +300,7 @@ async def _send_evolution(endpoint: str, body: dict) -> bool:
 
 
 async def send_text(to: str, body: str) -> bool:
+    _clear_numeric_shortcuts(to)
     if settings.dry_run:
         return await _send({"to": to, "type": "text", "text": {"body": body}})
     if _is_evolution():
@@ -330,10 +349,16 @@ async def _send_evolution_poll_or_text(to: str, body: str, poll_values: list[str
         return await send_text(to, body)
     if len(poll_values) == 1:
         option_label = poll_values[0].removeprefix("1. ").strip()
-        return await send_text(to, f"{body}\n\nReply 1 for {option_label}")
+        return await _send_evolution(
+            "sendText",
+            {"number": _clean_phone(to), "text": f"{body}\n\nReply 1 for {option_label}", "delay": EVOLUTION_DELAY_MS},
+        )
     if len(poll_values) > 12:
         options_text = "\n".join(poll_values)
-        return await send_text(to, f"{body}\n\n{options_text}")
+        return await _send_evolution(
+            "sendText",
+            {"number": _clean_phone(to), "text": f"{body}\n\n{options_text}", "delay": EVOLUTION_DELAY_MS},
+        )
     return await _send_evolution(
         "sendPoll",
         {
@@ -383,14 +408,17 @@ async def send_list(to: str, body: str, button_label: str, section_title: str, r
     """List message: up to 10 rows on Meta, or a 1-tap Poll on Evolution API."""
     sliced_rows = rows[:10]
     poll_rows = rows if _is_evolution() else sliced_rows
-    poll_options = [(str(r["id"]), str(r["title"])) for r in poll_rows]
+    poll_options: list[tuple[str, str]] = []
     extra_aliases: dict[str, str] = {}
     for idx, r in enumerate(poll_rows, start=1):
+        row_id = str(r["id"])
+        title = str(r["title"]).strip()
         desc = (r.get("description") or "").strip()
+        display_title = f"{title} - {desc}" if desc else title
+        poll_options.append((row_id, display_title))
         if desc:
-            title = str(r["title"]).strip()
-            extra_aliases[f"{title} - {desc}"] = str(r["id"])
-            extra_aliases[f"{idx}. {title} - {desc}"] = str(r["id"])
+            extra_aliases[title] = row_id
+            extra_aliases[f"{idx}. {title}"] = row_id
     poll_values = _populate_menu_map(to, poll_options, kind="list", extra_aliases=extra_aliases)
 
     if settings.dry_run:
@@ -533,6 +561,17 @@ def _extract_poll_selections(item: dict) -> list[tuple[str, str | None, str | No
     return results
 
 
+def _resolve_whatsapp_jid(*candidates: Any) -> str:
+    """Return the first valid `@s.whatsapp.net` JID from candidates (handling `@lid` / `remoteJidAlt` / `senderPn`)."""
+    for cand in candidates:
+        if not isinstance(cand, str):
+            continue
+        cleaned = cand.strip()
+        if cleaned.endswith("@s.whatsapp.net"):
+            return cleaned
+    return ""
+
+
 def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
     """Parse Evolution API v2 `messages.upsert` and `messages.update` webhook payloads."""
     raw_event = str(payload.get("event") or "").strip().lower().replace("_", ".")
@@ -558,7 +597,13 @@ def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
         if from_me is True:
             continue
 
-        remote_jid = key.get("remoteJid") or item.get("remoteJid") or ""
+        remote_jid = _resolve_whatsapp_jid(
+            key.get("remoteJid"),
+            key.get("remoteJidAlt"),
+            item.get("remoteJid"),
+            item.get("remoteJidAlt"),
+            item.get("senderPn"),
+        )
         key_id = str(key.get("id") or item.get("keyId") or "").strip()
 
         if raw_event == "messages.update":
@@ -568,11 +613,17 @@ def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
             for selected_option, vote_key_id, voter_jid, vote_from_me in poll_selections:
                 if vote_from_me is True:
                     continue
-                effective_jid = remote_jid or (voter_jid or "")
-                if not isinstance(effective_jid, str) or not effective_jid.endswith("@s.whatsapp.net"):
+                effective_jid = _resolve_whatsapp_jid(remote_jid, voter_jid)
+                if not effective_jid:
                     continue
-                dedup_id = key_id or (vote_key_id or "")
-                if not dedup_id or SEEN_MESSAGE_IDS.add_or_seen(dedup_id):
+                base_id = key_id or (vote_key_id or "")
+                if not base_id:
+                    continue
+                if vote_key_id and vote_key_id != key_id:
+                    dedup_id = f"{base_id}:{vote_key_id}:{selected_option}"[:200]
+                else:
+                    dedup_id = f"{base_id}:{selected_option}"[:200]
+                if SEEN_MESSAGE_IDS.add_or_seen(dedup_id):
                     continue
                 phone = _clean_phone(effective_jid)
                 resolved_id = resolve_menu_selection(phone, selected_option)
@@ -599,7 +650,7 @@ def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
             continue
 
         # messages.upsert
-        if not isinstance(remote_jid, str) or not remote_jid.endswith("@s.whatsapp.net"):
+        if not remote_jid:
             continue
         phone = _clean_phone(remote_jid)
         msg_obj = item.get("message") if isinstance(item.get("message"), dict) else {}

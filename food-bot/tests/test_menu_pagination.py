@@ -333,12 +333,6 @@ async def test_menupg_route_rejects_a_page_that_is_not_digits(route, spies, outb
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason='Known gap: "²".isdigit() is True but int("²") raises ValueError, so the isdigit() check '
-    "lets these through and the bot crashes. Fix in state_machine.py: use .isdecimal() instead.",
-)
 @pytest.mark.parametrize("reply_id", ["menupg:²", "menupg:①"])
 async def test_menupg_route_rejects_digit_lookalike_characters(route, spies, outbox, reply_id):
     await state_machine.handle_incoming(None, tap(reply_id))

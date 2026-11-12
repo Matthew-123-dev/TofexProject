@@ -136,7 +136,8 @@ async def test_evolution_outbound_text_media_and_polls(monkeypatch):
     assert whatsapp.LAST_MENU_MAP[phone]["DRINKS"] == "cat:Drinks"
 
     # 5. Single-option send_list + single-option send_buttons (show_carts / checkout transition)
-    #    must pad to 2 options so Evolution sendPoll never fails with HTTP 400 (min length 2).
+    #    must pad to 2 options so Evolution sendPoll never fails with HTTP 400 (min length 2),
+    #    and include row description (item count & subtotal) in poll values.
     assert await whatsapp.send_list(
         phone,
         "Tap a cart to select or unselect it, then choose Checkout.",
@@ -145,7 +146,7 @@ async def test_evolution_outbound_text_media_and_polls(monkeypatch):
         [{"id": "cart:1", "title": "✓ Cart 1", "description": "2 item(s), ₦3,000"}],
     ) is True
     assert calls[-1]["url"] == "https://evolution.railway.app/message/sendPoll/tofex-main"
-    assert calls[-1]["json"]["values"] == ["1. ✓ Cart 1", "2. Browse menu"]
+    assert calls[-1]["json"]["values"] == ["1. ✓ Cart 1 - 2 item(s), ₦3,000", "2. Browse menu"]
 
     assert await whatsapp.send_buttons(
         phone,
@@ -159,9 +160,37 @@ async def test_evolution_outbound_text_media_and_polls(monkeypatch):
     assert whatsapp.LAST_MENU_MAP[phone]["checkout"] == "checkout"
     assert whatsapp.LAST_MENU_MAP[phone]["2"] == "menu"
     assert whatsapp.LAST_MENU_MAP[phone]["2. Browse menu"] == "menu"
-    # Tapping the preceding cart list poll option also still resolves!
+    # Tapping the preceding cart list poll option (with or without description) also still resolves!
+    assert whatsapp.LAST_MENU_MAP[phone]["1. ✓ Cart 1 - 2 item(s), ₦3,000"] == "cart:1"
     assert whatsapp.LAST_MENU_MAP[phone]["1. ✓ Cart 1"] == "cart:1"
     assert whatsapp.LAST_MENU_MAP[phone]["✓ cart 1"] == "cart:1"
+
+    # 5b. Pagination buttons following a category item list keep numeric keys "1".."2" pointing to items
+    assert await whatsapp.send_list(
+        phone,
+        "*Drinks*: tap an item to add it\nPage 1/2",
+        "Choose item",
+        "Drinks",
+        [
+            {"id": "add:10", "title": "Active", "description": "₦2,000"},
+            {"id": "add:11", "title": "Berryblast", "description": "₦1,500"},
+        ],
+    ) is True
+    assert await whatsapp.send_buttons(
+        phone,
+        "Browsing Drinks: page 1 of 2.",
+        [("menu", "Categories"), ("catpg:Drinks:1", "Next")],
+    ) is True
+    assert whatsapp.LAST_MENU_MAP[phone]["1"] == "add:10"
+    assert whatsapp.LAST_MENU_MAP[phone]["2"] == "add:11"
+    assert whatsapp.LAST_MENU_MAP[phone]["2. Next"] == "catpg:Drinks:1"
+    assert whatsapp.LAST_MENU_MAP[phone]["next"] == "catpg:Drinks:1"
+
+    # 5c. send_text clears bare numeric shortcuts ("1", "2") so free-text answers (like rider FAIL_PROMPT)
+    #     are not hijacked, while keeping full poll option labels active for poll taps.
+    assert await whatsapp.send_text(phone, "Please reply with the reason numbers, for example: 1,3") is True
+    assert "1" not in whatsapp.LAST_MENU_MAP[phone]
+    assert whatsapp.LAST_MENU_MAP[phone]["2. Next"] == "catpg:Drinks:1"
 
     # 6. Single-option address skip button pads with ("cancel", "Cancel order")
     assert await whatsapp.send_buttons(
@@ -304,3 +333,22 @@ async def test_inbound_evolution_filtering_dedup_and_resolution(client, db, user
     assert call_args[0] == phone
     assert f"*{menu_item.name}*" in call_args[1]
     assert call_args[4][0]["id"] == f"qty:{menu_item.id}:1"
+
+    # 5. @lid remoteJid with remoteJidAlt (@s.whatsapp.net) is accepted
+    lid_payload = {
+        "event": "messages.upsert",
+        "instance": "tofex-main",
+        "data": {
+            "key": {
+                "remoteJid": "19485739201@lid",
+                "remoteJidAlt": jid,
+                "fromMe": False,
+                "id": "evo-lid-msg-300",
+            },
+            "message": {"conversation": "checkout"},
+        },
+    }
+    parsed_lid = whatsapp.parse_incoming(lid_payload)
+    assert len(parsed_lid) == 1
+    assert parsed_lid[0].sender == phone
+    assert parsed_lid[0].text == "checkout"

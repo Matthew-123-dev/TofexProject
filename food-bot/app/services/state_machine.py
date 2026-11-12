@@ -141,10 +141,10 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await handle_menu_request(session, user)
     if rid.startswith("notreceived:"):
         batch_text = rid.removeprefix("notreceived:")
-        return await handle_not_received(session, user, int(batch_text) if batch_text.isdigit() else 0)
+        return await handle_not_received(session, user, int(batch_text) if batch_text.isdecimal() else 0)
     if rid.startswith("menupg:"):
         menu_page_text = rid.removeprefix("menupg:")
-        if not menu_page_text.isdigit():
+        if not menu_page_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
             return
         return await handle_menu_request(session, user, int(menu_page_text))
@@ -154,7 +154,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
             await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
             return
         category, page_text = category_page.rsplit(":", 1)
-        if not page_text.isdigit():
+        if not page_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That menu page is invalid. Send *menu* to start again.")
             return
         return await handle_category_selected(session, user, category, int(page_text))
@@ -162,33 +162,36 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await handle_category_selected(session, user, rid.removeprefix("cat:"))
     if rid.startswith("add:"):
         item_id_text = rid.removeprefix("add:")
-        if not item_id_text.isdigit():
+        if not item_id_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
             return
         return await show_quantity_selection(session, user, int(item_id_text))
     if rid.startswith("qty:"):
         quantity_parts = rid.removeprefix("qty:").split(":")
-        if len(quantity_parts) != 2 or not all(part.isdigit() for part in quantity_parts):
+        if len(quantity_parts) != 2 or not all(part.isdecimal() for part in quantity_parts):
             await whatsapp.send_text(user.phone_number, "That quantity is invalid. Send *menu* to start again.")
             return
         return await handle_add_item(session, user, int(quantity_parts[0]), int(quantity_parts[1]))
-    if rid == "carts":
+    if rid == "carts" or text in {"cart", "carts"}:
         return await show_carts(session, user)
-    if rid == "newcart":
+    if rid == "newcart" or text in {"newcart", "new cart"}:
         await order_service.create_cart(session, user.id)
         await whatsapp.send_text(user.phone_number, "Created a new cart. Send *menu* to add items to it.")
         return
     if rid.startswith("cart:"):
         cart_text = rid.removeprefix("cart:")
-        if not cart_text.isdigit():
+        if not cart_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That cart could not be found.")
             return
         return await toggle_cart(session, user, int(cart_text))
-    if rid == "checkout":
+    if rid == "checkout" or text in {"checkout", "check out"}:
         return await handle_checkout(session, user)
 
     if user.current_state == SessionState.AWAITING_RECEIPT and msg.type == "image" and msg.media_id:
         return await handle_receipt_upload(session, user, msg.media_id)
+
+    if open_fulfillment is not None:
+        return await handle_checkout_flow(session, user, open_fulfillment, msg)
 
     await whatsapp.send_text(user.phone_number, "Hi! Send *menu* to see what's available right now.")
 
@@ -399,7 +402,7 @@ async def handle_rider_message(session: AsyncSession, rider: Rider, msg: Incomin
     if rid.startswith("r:"):
         parts = rid.split(":")
         action = parts[1] if len(parts) > 1 else ""
-        batch_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        batch_id = int(parts[2]) if len(parts) > 2 and parts[2].isdecimal() else 0
         if action == "picked" and batch_id:
             return await rider_mark_picked(session, rider, batch_id)
         if action == "deliv" and batch_id:
@@ -982,7 +985,8 @@ async def process_address_step(
 
     if step == "area":
         if msg.reply_id and msg.reply_id.startswith("areas:"):
-            page = int(msg.reply_id.split(":", 1)[1])
+            page_str = msg.reply_id.split(":", 1)[1]
+            page = int(page_str) if page_str.isdecimal() else 0
             await send_area_page(session, user, fulfillment, page)
             return
         if msg.reply_id == "area:other":
@@ -990,7 +994,11 @@ async def process_address_step(
             await whatsapp.send_text(user.phone_number, M3B_OTHER_AREA)
             return
         if msg.reply_id and msg.reply_id.startswith("area:"):
-            area_id = int(msg.reply_id.split(":", 1)[1])
+            area_id_str = msg.reply_id.split(":", 1)[1]
+            if not area_id_str.isdecimal():
+                await send_area_page(session, user, fulfillment, 0)
+                return
+            area_id = int(area_id_str)
             area = await session.get(DeliveryArea, area_id)
             if area is None or not area.is_active:
                 await send_area_page(session, user, fulfillment, 0)
