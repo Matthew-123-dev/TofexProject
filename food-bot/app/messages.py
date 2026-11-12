@@ -6,10 +6,11 @@ M1_CHOICE = (
     "How would you like to receive your order?"
 )
 M2_STREET = (
-    "✍️ *TYPE YOUR STREET ADDRESS BELOW (Step 5 of 6)*\n"
+    "✍️ *TYPE YOUR STREET ADDRESS & LANDMARK (Step 5 of 6)*\n"
     "Great, delivery it is! 🛵\n\n"
-    "Please type your *street address and house/plot number* (5–150 characters).\n"
-    "👉 Example: *14 Denro-Ishashi Road, Akute*\n\n"
+    "Please type your *house/plot number, street name, and nearest landmark* in one message (8–220 characters).\n"
+    "👉 Example: *14 Denro-Ishashi Road, opposite St. Leo Catholic Church*\n\n"
+    "📍 _Tip: You can also share your WhatsApp Location Pin right now!_\n"
     "_(Or reply *BACK* to change your area, or *CANCEL* to cancel)_"
 )
 M3_AREA = (

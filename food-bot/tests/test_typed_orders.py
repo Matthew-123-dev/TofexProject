@@ -131,7 +131,7 @@ async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
     assert "Step 4 of 6" in step4_body
     assert "₦3,300" in step4_body
 
-    # Proceed to checkout -> Delivery -> Area -> Street -> Skip Pin -> Landmark -> Skip Phone -> Rider Note -> Confirm
+    # Proceed to checkout -> Delivery -> Area -> Combined Street & Landmark -> Optional Rider Note via address:extras -> Confirm
     await state_machine.handle_incoming(
         db, IncomingMessage(id="to-5", sender=user.phone_number, type="interactive", reply_id="checkout")
     )
@@ -142,16 +142,19 @@ async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
         db, IncomingMessage(id="to-7", sender=user.phone_number, type="interactive", reply_id=f"area:{area.id}")
     )
     await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-8", sender=user.phone_number, type="text", text="14 Denro Road, Akute")
+        db,
+        IncomingMessage(
+            id="to-8",
+            sender=user.phone_number,
+            type="text",
+            text="14 Denro Road, Opposite St Leo Church",
+        ),
     )
     await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-9", sender=user.phone_number, type="interactive", reply_id="address:skip_pin")
+        db, IncomingMessage(id="to-9", sender=user.phone_number, type="interactive", reply_id="address:extras")
     )
     await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-10", sender=user.phone_number, type="text", text="Opposite St Leo Church")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-11", sender=user.phone_number, type="interactive", reply_id="address:skip_phone")
+        db, IncomingMessage(id="to-10", sender=user.phone_number, type="interactive", reply_id="extras:notes")
     )
     await state_machine.handle_incoming(
         db, IncomingMessage(id="to-12", sender=user.phone_number, type="text", text="Call at the estate gate")

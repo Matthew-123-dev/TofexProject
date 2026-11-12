@@ -1816,6 +1816,69 @@ async def save_address(session: AsyncSession, user: User, fulfillment: Fulfillme
     await session.flush()
 
 
+def _parse_combined_address(raw: str) -> tuple[str, str] | None:
+    """Validate and split a combined street + landmark message into `(street, landmark)`.
+
+    Returns `None` if the input is too short or vague (< 8 chars or < 2 words).
+    """
+    cleaned = re.sub(r"\s+", " ", (raw or "").strip())
+    if len(cleaned) < 8 or len(cleaned) > 220 or len(cleaned.split()) < 2:
+        return None
+
+    # 1. Explicit landmark preposition phrase after street text
+    m = re.match(
+        r"^(?P<street>.{4,}?)(?:[,;\n-]+\s*|\s+)(?P<landmark>(?:opposite|opp\.?|near|beside|behind|by|after|before|adjacent|close\s+to|next\s+to|off|around|at)\b.+)$",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if m:
+        street = m.group("street").strip(" ,;-")[:150]
+        landmark = m.group("landmark").strip(" ,;-")[:100]
+        if street and landmark:
+            return street, landmark
+
+    # 2. Comma / semicolon / dash separator
+    parts = [p.strip() for p in re.split(r"[,;\n]+|\s+-\s+", cleaned) if p.strip()]
+    if len(parts) >= 2:
+        street = parts[0][:150]
+        landmark = ", ".join(parts[1:])[:100]
+        if street and landmark:
+            return street, landmark
+
+    # 3. Single multi-word address phrase
+    return cleaned[:150], cleaned[:100]
+
+
+async def _send_extras_menu(user: User, fulfillment: Fulfillment) -> None:
+    """Send the optional delivery details picker from the Step 6 Summary screen."""
+    status_parts: list[str] = []
+    if fulfillment.latitude is not None and fulfillment.longitude is not None:
+        status_parts.append("📌 GPS Pin: Added")
+    if fulfillment.phone2:
+        status_parts.append(f"📞 Phone 2: {fulfillment.phone2}")
+    rider_note = _extract_rider_notes(fulfillment.notes)
+    if rider_note:
+        status_parts.append(f"📝 Note: {rider_note[:30]}")
+    status_line = " · ".join(status_parts) if status_parts else "No optional details added yet"
+
+    await whatsapp.send_buttons(
+        user.phone_number,
+        (
+            f"Step 6 of 6: Optional delivery details\n"
+            f"{status_line}\n"
+            f"Select an optional detail to add or return to your summary:"
+        ),
+        [
+            ("extras:done", "✅ Done — Back to Order Summary"),
+            ("extras:pin", "📍 Share GPS location pin"),
+            ("extras:phone2", "📞 Add backup phone number"),
+            ("extras:notes", "📝 Add delivery / gate note"),
+            ("nav:back", "⬅ Go back"),
+            ("cancel", "❌ Cancel order"),
+        ],
+    )
+
+
 async def _handle_checkout_go_back(
     session: AsyncSession, user: User, fulfillment: Fulfillment, batch: PaymentBatch
 ) -> None:
@@ -1844,29 +1907,29 @@ async def _handle_checkout_go_back(
         fulfillment.checkout_step = "area"
         await send_area_page(session, user, fulfillment, 0, batch=batch)
         return
-    if step == "pin":
-        fulfillment.checkout_step = "street"
-        await whatsapp.send_text(user.phone_number, M2_STREET)
+    if step == "extras":
+        fulfillment.checkout_step = "summary"
+        await send_summary(session, user, fulfillment, batch=batch)
+        return
+    if step in ("pin", "phone2", "notes"):
+        if fulfillment.street:
+            fulfillment.checkout_step = "extras"
+            await _send_extras_menu(user, fulfillment)
+        else:
+            fulfillment.checkout_step = "street"
+            await whatsapp.send_text(user.phone_number, M2_STREET)
         return
     if step == "landmark":
-        fulfillment.checkout_step = "pin"
-        await ask_pin(session, user)
-        return
-    if step == "phone2":
-        fulfillment.checkout_step = "landmark"
-        await whatsapp.send_text(user.phone_number, M5_LANDMARK)
-        return
-    if step == "notes":
-        fulfillment.checkout_step = "phone2"
-        await _send_phone2_prompt(user)
+        fulfillment.checkout_step = "street"
+        await whatsapp.send_text(user.phone_number, M2_STREET)
         return
     if step == "summary":
         if fulfillment.fulfillment_type == "pickup":
             fulfillment.checkout_step = "choice"
             await _send_fulfillment_choice_poll(user, batch)
         else:
-            fulfillment.checkout_step = "notes"
-            await _send_notes_prompt(user)
+            fulfillment.checkout_step = "street"
+            await whatsapp.send_text(user.phone_number, M2_STREET)
         return
 
 
@@ -1876,7 +1939,7 @@ async def _send_phone2_prompt(user: User) -> None:
         M6_SECOND_PHONE,
         [
             ("address:skip_phone", "⏭️ Skip backup phone"),
-            ("address:fast_summary", "⚡ Skip optional details — Review order"),
+            ("address:fast_summary", "⚡ Back to Order Summary"),
             ("nav:back", "⬅ Go back"),
             ("cancel", "❌ Cancel order"),
         ],
@@ -1994,26 +2057,71 @@ async def process_address_step(
         return
 
     if step == "street":
-        if len(text) < 5 or len(text) > 150:
+        if msg.type == "location" and msg.latitude is not None and msg.longitude is not None:
+            fulfillment.latitude = msg.latitude
+            fulfillment.longitude = msg.longitude
+            if fulfillment.street:
+                fulfillment.checkout_step = "summary"
+                await send_summary(session, user, fulfillment, batch=batch)
+            else:
+                await whatsapp.send_text(
+                    user.phone_number,
+                    (
+                        "📍 *GPS Location Pin saved! (Step 5 of 6)*\n"
+                        "Now please type your *house/gate number, street name, and nearest landmark* in one message so our rider knows your exact door.\n"
+                        "👉 Example: *14 Denro Road, yellow gate opposite St. Leo Church*\n\n"
+                        "_(Or reply *BACK* to change your area, or *CANCEL* to cancel)_"
+                    ),
+                )
+            return
+
+        parsed = _parse_combined_address(text)
+        if parsed is None:
             await whatsapp.send_text(
                 user.phone_number,
-                "⚠️ Please send a street address between 5 and 150 characters, including your house or plot number (or reply *BACK*).",
+                "⚠️ Please type both your *house/street address* and a *nearby landmark* in one message (at least 8 characters, e.g. *14 Denro Road, opposite St. Leo Church*), or reply *BACK*.",
             )
             return
-        fulfillment.street = text
-        fulfillment.checkout_step = "pin"
-        await ask_pin(session, user)
+        fulfillment.street, fulfillment.landmark = parsed
+        fulfillment.checkout_step = "summary"
+        await send_summary(session, user, fulfillment, batch=batch)
+        return
+
+    if step == "extras":
+        if rid == "extras:done":
+            fulfillment.checkout_step = "summary"
+            await send_summary(session, user, fulfillment, batch=batch)
+            return
+        if rid == "extras:pin":
+            fulfillment.checkout_step = "pin"
+            await ask_pin(session, user)
+            return
+        if rid == "extras:phone2":
+            fulfillment.checkout_step = "phone2"
+            await _send_phone2_prompt(user)
+            return
+        if rid == "extras:notes":
+            fulfillment.checkout_step = "notes"
+            await _send_notes_prompt(user)
+            return
+        if msg.type == "location" and msg.latitude is not None and msg.longitude is not None:
+            fulfillment.latitude = msg.latitude
+            fulfillment.longitude = msg.longitude
+            fulfillment.checkout_step = "summary"
+            await send_summary(session, user, fulfillment, batch=batch)
+            return
+        await _send_extras_menu(user, fulfillment)
         return
 
     if step == "pin":
         if msg.type == "location" and msg.latitude is not None and msg.longitude is not None:
             fulfillment.latitude = msg.latitude
             fulfillment.longitude = msg.longitude
-            fulfillment.checkout_step = "landmark"
-            await whatsapp.send_text(user.phone_number, M5_LANDMARK)
+            fulfillment.checkout_step = "summary"
+            await send_summary(session, user, fulfillment, batch=batch)
         elif lowered == "skip" or rid == "address:skip_pin":
-            fulfillment.checkout_step = "landmark"
-            await whatsapp.send_text(user.phone_number, M5_LANDMARK)
+            fulfillment.checkout_step = "summary"
+            await send_summary(session, user, fulfillment, batch=batch)
         else:
             await ask_pin(session, user)
         return
@@ -2026,8 +2134,8 @@ async def process_address_step(
             )
             return
         fulfillment.landmark = text
-        fulfillment.checkout_step = "phone2"
-        await _send_phone2_prompt(user)
+        fulfillment.checkout_step = "summary"
+        await send_summary(session, user, fulfillment, batch=batch)
         return
 
     if step == "phone2":
@@ -2039,8 +2147,8 @@ async def process_address_step(
             return
         if lowered == "skip" or rid == "address:skip_phone":
             fulfillment.phone2 = None
-            fulfillment.checkout_step = "notes"
-            await _send_notes_prompt(user)
+            fulfillment.checkout_step = "summary"
+            await send_summary(session, user, fulfillment, batch=batch)
             return
         try:
             fulfillment.phone2 = normalize_phone(text)
@@ -2050,14 +2158,14 @@ async def process_address_step(
                 "⚠️ That phone number doesn't look valid (e.g. *08031234567*). Please try again or tap Skip below:",
                 [
                     ("address:skip_phone", "⏭️ Skip backup phone"),
-                    ("address:fast_summary", "⚡ Skip optional details — Review order"),
+                    ("address:fast_summary", "⚡ Back to Order Summary"),
                     ("nav:back", "⬅ Go back"),
                     ("cancel", "❌ Cancel order"),
                 ],
             )
             return
-        fulfillment.checkout_step = "notes"
-        await _send_notes_prompt(user)
+        fulfillment.checkout_step = "summary"
+        await send_summary(session, user, fulfillment, batch=batch)
         return
 
     if step == "notes":
@@ -2069,6 +2177,15 @@ async def process_address_step(
         return
 
     if step == "summary":
+        if msg.type == "location" and msg.latitude is not None and msg.longitude is not None:
+            fulfillment.latitude = msg.latitude
+            fulfillment.longitude = msg.longitude
+            await send_summary(session, user, fulfillment, batch=batch)
+            return
+        if rid == "address:extras":
+            fulfillment.checkout_step = "extras"
+            await _send_extras_menu(user, fulfillment)
+            return
         if rid == "address:edit":
             if fulfillment.fulfillment_type == "pickup":
                 fulfillment.checkout_step = "choice"
@@ -2119,7 +2236,7 @@ async def ask_pin(session: AsyncSession, user: User) -> None:
     await whatsapp.send_location_request(user.phone_number, M4_PIN)
     await whatsapp.send_buttons(
         user.phone_number,
-        "Step 5 of 6: Share location pin or skip\nTap an option below if you'd like to skip sharing your GPS pin:",
+        "Step 6 of 6: Share location pin or skip\nTap an option below if you'd like to skip sharing your GPS pin:",
         [
             ("address:skip_pin", "⏭️ Skip location pin"),
             ("nav:back", "⬅ Go back"),
@@ -2177,35 +2294,46 @@ async def send_summary(
             subtotal=naira(subtotal),
             total=total_text,
         )
+        confirm_buttons = [
+            ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
+            ("address:edit", "📍 Edit delivery / pickup"),
+            ("checkout:edit_items", "🛒 Edit items in cart"),
+            ("nav:back", "⬅ Go back"),
+            ("cancel", "❌ Cancel order"),
+        ]
     else:
         area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
         if area is not None:
             fee_text, total_text = naira(area.fee), naira(subtotal + area.fee)
         else:  # "Other area": staff will quote the fee after the customer confirms
             fee_text, total_text = "to be confirmed", f"{naira(subtotal)} + delivery fee"
+        pin_line = "📌 GPS Pin: Shared ✅\n" if fulfillment.latitude is not None and fulfillment.longitude is not None else ""
+        phone_line = f"📞 Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else ""
         summary_text = M8_SUMMARY.format(
             items_block=items_block,
             street=fulfillment.street or "",
             area=fulfillment.area_name or "",
             landmark=fulfillment.landmark or "",
-            second_phone_line=f"📞 Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else "",
+            second_phone_line=f"{pin_line}{phone_line}",
             notes_line=f"📝 Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
             subtotal=naira(subtotal),
             fee=fee_text,
             total=total_text,
         )
+        confirm_buttons = [
+            ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
+            ("address:extras", "➕ Add Pin / Phone / Note"),
+            ("address:edit", "📍 Edit delivery / pickup"),
+            ("checkout:edit_items", "🛒 Edit items in cart"),
+            ("nav:back", "⬅ Go back"),
+            ("cancel", "❌ Cancel order"),
+        ]
 
     await whatsapp.send_text(user.phone_number, summary_text)
     await whatsapp.send_buttons(
         user.phone_number,
         M8_CONFIRM_POLL.format(total=total_text),
-        [
-            ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
-            ("address:edit", "📍 Edit delivery / pickup"),
-            ("checkout:edit_items", "🛒 Edit items in cart"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
-        ],
+        confirm_buttons,
     )
 
 

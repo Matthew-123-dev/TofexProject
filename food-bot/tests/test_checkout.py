@@ -81,60 +81,31 @@ async def test_checkout_flow(db, user, menu_item, delivery_area):
     )
     assert fulfillment.checkout_step == "street"
 
+    # Vague 1-word address is rejected and stays on "street"
+    await state_machine.handle_incoming(
+        db,
+        IncomingMessage(
+            id="m8-vague",
+            sender=user.phone_number,
+            type="text",
+            text="Ikeja",
+        ),
+    )
+    assert fulfillment.checkout_step == "street"
+
+    # Combined street + landmark goes directly to "summary"
     await state_machine.handle_incoming(
         db,
         IncomingMessage(
             id="m8",
             sender=user.phone_number,
             type="text",
-            text="12 Test Street, Ikeja",
-        ),
-    )
-    assert fulfillment.checkout_step == "pin"
-
-    await state_machine.handle_incoming(
-        db,
-        IncomingMessage(
-            id="m9",
-            sender=user.phone_number,
-            type="interactive",
-            reply_id="address:skip_pin",
-        ),
-    )
-    assert fulfillment.checkout_step == "landmark"
-
-    await state_machine.handle_incoming(
-        db,
-        IncomingMessage(
-            id="m10",
-            sender=user.phone_number,
-            type="text",
-            text="Near St. Leo Church",
-        ),
-    )
-    assert fulfillment.checkout_step == "phone2"
-
-    await state_machine.handle_incoming(
-        db,
-        IncomingMessage(
-            id="m11",
-            sender=user.phone_number,
-            type="interactive",
-            reply_id="address:skip_phone",
-        ),
-    )
-    assert fulfillment.checkout_step == "notes"
-
-    await state_machine.handle_incoming(
-        db,
-        IncomingMessage(
-            id="m12",
-            sender=user.phone_number,
-            type="interactive",
-            reply_id="address:skip_notes",
+            text="12 Test Street, Near St. Leo Church",
         ),
     )
     assert fulfillment.checkout_step == "summary"
+    assert fulfillment.street == "12 Test Street"
+    assert fulfillment.landmark == "Near St. Leo Church"
 
     # 4. Confirm summary -> moves to AWAITING_PAYMENT with total = 1000 + 1500 = 2500
     await state_machine.handle_incoming(
@@ -216,19 +187,13 @@ async def test_saved_address_reuse_fee_update_and_disabled_fallback(db, user, me
         db, IncomingMessage(id="o1-area", sender=user_phone, type="interactive", reply_id=f"area:{area_id}")
     )
     await state_machine.handle_incoming(
-        db, IncomingMessage(id="o1-street", sender=user_phone, type="text", text="45 Marina Road")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="o1-pin", sender=user_phone, type="interactive", reply_id="address:skip_pin")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="o1-lm", sender=user_phone, type="text", text="Opposite General Hospital")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="o1-ph", sender=user_phone, type="interactive", reply_id="address:skip_phone")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="o1-nt", sender=user_phone, type="interactive", reply_id="address:skip_notes")
+        db,
+        IncomingMessage(
+            id="o1-street",
+            sender=user_phone,
+            type="text",
+            text="45 Marina Road, Opposite General Hospital",
+        ),
     )
     await state_machine.handle_incoming(
         db, IncomingMessage(id="o1-ok", sender=user_phone, type="interactive", reply_id="address:confirm")
@@ -238,6 +203,7 @@ async def test_saved_address_reuse_fee_update_and_disabled_fallback(db, user, me
     saved = (await db.execute(select(SavedAddress).where(SavedAddress.user_id == user_id))).scalar_one_or_none()
     assert saved is not None
     assert saved.street == "45 Marina Road"
+    assert saved.landmark == "Opposite General Hospital"
     assert saved.area_id == area_id
 
     # Cancel order 1 so we can start a second order
