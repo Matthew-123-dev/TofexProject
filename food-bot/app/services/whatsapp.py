@@ -1,4 +1,8 @@
+import base64
+from collections import OrderedDict
 import logging
+import time
+from typing import Any
 
 import httpx
 
@@ -8,15 +12,210 @@ from app.schemas import IncomingMessage
 
 logger = logging.getLogger(__name__)
 GRAPH = "https://graph.facebook.com"
+EVOLUTION_DELAY_MS = 1200
+
+
+def _clean_phone(phone: str) -> str:
+    """Normalize a WhatsApp JID or phone string to bare digits/identifier."""
+    cleaned = (phone or "").strip()
+    if "@" in cleaned:
+        cleaned = cleaned.split("@", 1)[0]
+    return cleaned.lstrip("+")
+
+
+class _CaseInsensitiveMenuMap(dict[str, str]):
+    """Per-user mapping from option number/title to Meta button_id or list_row_id."""
+
+    def __getitem__(self, key: str) -> str:
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        if isinstance(key, str):
+            norm = key.strip().lower()
+            if super().__contains__(norm):
+                return super().__getitem__(norm)
+        raise KeyError(key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        if super().__contains__(key):
+            return True
+        if isinstance(key, str):
+            return super().__contains__(key.strip().lower())
+        return False
+
+
+class _PhoneMenuCache(dict[str, _CaseInsensitiveMenuMap]):
+    """Per-phone cache that normalizes phone numbers on access."""
+
+    def __getitem__(self, phone: str) -> _CaseInsensitiveMenuMap:
+        norm = _clean_phone(phone)
+        if super().__contains__(norm):
+            return super().__getitem__(norm)
+        return super().__getitem__(phone)
+
+    def __setitem__(self, phone: str, value: dict[str, str]) -> None:
+        mapped = value if isinstance(value, _CaseInsensitiveMenuMap) else _CaseInsensitiveMenuMap(value)
+        super().__setitem__(_clean_phone(phone), mapped)
+
+    def get(self, phone: str, default: Any = None) -> Any:
+        try:
+            return self[phone]
+        except KeyError:
+            return default
+
+    def __contains__(self, phone: object) -> bool:
+        if isinstance(phone, str):
+            return super().__contains__(_clean_phone(phone)) or super().__contains__(phone)
+        return super().__contains__(phone)
+
+
+class BoundedTTLCache:
+    """Bounded in-memory TTL cache/set for webhook message ID deduplication."""
+
+    def __init__(self, maxsize: int = 4096, ttl: float = 3600.0) -> None:
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._store: OrderedDict[str, float] = OrderedDict()
+
+    def _purge(self, now: float) -> None:
+        cutoff = now - self.ttl
+        while self._store:
+            oldest_key, ts = next(iter(self._store.items()))
+            if ts <= cutoff:
+                self._store.popitem(last=False)
+            else:
+                break
+
+    def add_or_seen(self, key: str) -> bool:
+        """Return True if `key` is already in cache (duplicate); otherwise record it and return False."""
+        if not key:
+            return False
+        now = time.monotonic()
+        self._purge(now)
+        if key in self._store:
+            self._store.move_to_end(key)
+            return True
+        self._store[key] = now
+        while len(self._store) > self.maxsize:
+            self._store.popitem(last=False)
+        return False
+
+    def add(self, key: str) -> None:
+        self.add_or_seen(key)
+
+    def __contains__(self, key: object) -> bool:
+        if not isinstance(key, str):
+            return False
+        self._purge(time.monotonic())
+        return key in self._store
+
+    def __len__(self) -> int:
+        self._purge(time.monotonic())
+        return len(self._store)
+
+    def clear(self) -> None:
+        self._store.clear()
+
+
+LAST_MENU_MAP: _PhoneMenuCache = _PhoneMenuCache()
+_LAST_MENU_KIND: dict[str, str] = {}
+SEEN_MESSAGE_IDS = BoundedTTLCache(maxsize=4096, ttl=3600.0)
+_MEDIA_CACHE: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+
+
+def _cache_inline_media(media_id: str, raw_b64: str, mime_type: str = "image/jpeg") -> None:
+    if not media_id or not raw_b64:
+        return
+    try:
+        cleaned = raw_b64.split(",", 1)[-1].strip()
+        content = base64.b64decode(cleaned)
+    except Exception:
+        return
+    _MEDIA_CACHE[media_id] = (content, mime_type or "image/jpeg")
+    while len(_MEDIA_CACHE) > 128:
+        _MEDIA_CACHE.popitem(last=False)
+
+
+def _populate_menu_map(
+    to: str,
+    options: list[tuple[str, str]],
+    *,
+    kind: str,
+    extra_aliases: dict[str, str] | None = None,
+) -> list[str]:
+    """Build 1-based poll values and update LAST_MENU_MAP[phone]."""
+    phone = _clean_phone(to)
+    mapping = _CaseInsensitiveMenuMap()
+
+    # When send_list is immediately followed by send_buttons in the same turn
+    # (e.g. show_carts or multi-page category browsing), retain non-numeric title
+    # keys from the list so tapping an option on either poll resolves cleanly.
+    if kind == "buttons" and _LAST_MENU_KIND.get(phone) == "list" and phone in LAST_MENU_MAP:
+        for existing_key, existing_val in LAST_MENU_MAP[phone].items():
+            if not existing_key.isdigit():
+                mapping[existing_key] = existing_val
+
+    poll_values: list[str] = []
+    for idx, (opt_id, raw_title) in enumerate(options, start=1):
+        title = (raw_title or "").strip()
+        numbered = f"{idx}. {title}"
+        poll_values.append(numbered)
+
+        mapping[str(idx)] = opt_id
+        mapping[numbered] = opt_id
+        mapping[numbered.lower()] = opt_id
+        mapping[title] = opt_id
+        mapping[title.lower()] = opt_id
+
+    if extra_aliases:
+        for alias, opt_id in extra_aliases.items():
+            mapping[alias] = opt_id
+            mapping[alias.lower()] = opt_id
+
+    LAST_MENU_MAP[phone] = mapping
+    _LAST_MENU_KIND[phone] = kind
+    return poll_values
+
+
+def resolve_menu_selection(phone: str, selection: str | None) -> str | None:
+    """Resolve a user's poll vote or text reply against LAST_MENU_MAP[phone]."""
+    if not selection:
+        return None
+    cleaned = selection.strip()
+    if not cleaned:
+        return None
+    menu = LAST_MENU_MAP.get(phone)
+    if not menu:
+        return None
+    return menu.get(cleaned)
+
+
+def _is_evolution() -> bool:
+    return settings.whatsapp_provider.strip().lower() == "evolution"
 
 
 def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
 
 
+def _evolution_headers() -> dict[str, str]:
+    return {"apikey": settings.evolution_api_key}
+
+
 def _render(payload: dict) -> str:
     if payload["type"] == "text":
         return payload["text"]["body"]
+    if payload["type"] in {"image", "video", "document", "audio"}:
+        mtype = payload["type"]
+        media_info = payload.get(mtype, {})
+        caption = media_info.get("caption", "")
+        link = media_info.get("link", "")
+        return f"[{mtype}] {link}" + (f"\n{caption}" if caption else "")
     inter = payload["interactive"]
     if inter["type"] == "button":
         opts = [f'  [{b["reply"]["id"]}] {b["reply"]["title"]}' for b in inter["action"]["buttons"]]
@@ -49,12 +248,94 @@ async def _send(payload: dict) -> bool:
     return True
 
 
+async def _send_evolution(endpoint: str, body: dict) -> bool:
+    base_url = settings.evolution_api_url.rstrip("/")
+    instance = settings.evolution_instance.strip("/")
+    url = f"{base_url}/message/{endpoint}/{instance}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, headers=_evolution_headers(), json=body)
+    except httpx.HTTPError:
+        logger.exception("Evolution API send failed (%s network error)", endpoint)
+        return False
+    if r.status_code >= 400:
+        logger.error("Evolution API send failed (%s): %s %s", endpoint, r.status_code, r.text)
+        return False
+    return True
+
+
 async def send_text(to: str, body: str) -> bool:
+    if settings.dry_run:
+        return await _send({"to": to, "type": "text", "text": {"body": body}})
+    if _is_evolution():
+        return await _send_evolution(
+            "sendText",
+            {"number": _clean_phone(to), "text": body, "delay": EVOLUTION_DELAY_MS},
+        )
     return await _send({"to": to, "type": "text", "text": {"body": body}})
 
 
+async def send_media(
+    to: str,
+    media: str,
+    caption: str = "",
+    media_type: str = "image",
+    file_name: str | None = None,
+) -> bool:
+    """Send a media file or flyer via Evolution API sendMedia or Meta Cloud API."""
+    if settings.dry_run:
+        return await _send({
+            "to": to,
+            "type": media_type,
+            media_type: {"link": media, **({"caption": caption} if caption else {})},
+        })
+    if _is_evolution():
+        payload: dict[str, Any] = {
+            "number": _clean_phone(to),
+            "mediatype": media_type,
+            "media": media,
+            "caption": caption,
+            "delay": EVOLUTION_DELAY_MS,
+        }
+        if file_name:
+            payload["fileName"] = file_name
+        return await _send_evolution("sendMedia", payload)
+    return await _send({
+        "to": to,
+        "type": media_type,
+        media_type: {"link": media, **({"caption": caption} if caption else {})},
+    })
+
+
 async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bool:
-    """Reply buttons: WhatsApp allows at most 3, titles up to 20 chars."""
+    """Reply buttons: WhatsApp allows at most 3 on Meta, or a 1-tap Poll on Evolution API."""
+    sliced_buttons = [(i, t[:20]) for i, t in buttons[:3]]
+    poll_options = [(i, t) for i, t in buttons]
+    poll_values = _populate_menu_map(to, poll_options, kind="buttons")
+
+    if settings.dry_run:
+        return await _send({
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body[:1024]},
+                "action": {"buttons": [
+                    {"type": "reply", "reply": {"id": i, "title": t}} for i, t in sliced_buttons
+                ]},
+            },
+        })
+    if _is_evolution():
+        return await _send_evolution(
+            "sendPoll",
+            {
+                "number": _clean_phone(to),
+                "name": body,
+                "selectableCount": 1,
+                "values": poll_values,
+                "delay": EVOLUTION_DELAY_MS,
+            },
+        )
     return await _send({
         "to": to,
         "type": "interactive",
@@ -62,14 +343,49 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
             "type": "button",
             "body": {"text": body[:1024]},
             "action": {"buttons": [
-                {"type": "reply", "reply": {"id": i, "title": t[:20]}} for i, t in buttons[:3]
+                {"type": "reply", "reply": {"id": i, "title": t}} for i, t in sliced_buttons
             ]},
         },
     })
 
 
 async def send_list(to: str, body: str, button_label: str, section_title: str, rows: list[dict]) -> bool:
-    """List message: up to 10 rows. Row = {id, title (<=24), description (<=72, optional)}."""
+    """List message: up to 10 rows on Meta, or a 1-tap Poll on Evolution API."""
+    sliced_rows = rows[:10]
+    poll_options = [(str(r["id"]), str(r["title"])) for r in sliced_rows]
+    extra_aliases: dict[str, str] = {}
+    for idx, r in enumerate(sliced_rows, start=1):
+        desc = (r.get("description") or "").strip()
+        if desc:
+            title = str(r["title"]).strip()
+            extra_aliases[f"{title} - {desc}"] = str(r["id"])
+            extra_aliases[f"{idx}. {title} - {desc}"] = str(r["id"])
+    poll_values = _populate_menu_map(to, poll_options, kind="list", extra_aliases=extra_aliases)
+
+    if settings.dry_run:
+        return await _send({
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": {"text": body},
+                "action": {
+                    "button": button_label[:20],
+                    "sections": [{"title": section_title[:24], "rows": sliced_rows}],
+                },
+            },
+        })
+    if _is_evolution():
+        return await _send_evolution(
+            "sendPoll",
+            {
+                "number": _clean_phone(to),
+                "name": body,
+                "selectableCount": 1,
+                "values": poll_values,
+                "delay": EVOLUTION_DELAY_MS,
+            },
+        )
     return await _send({
         "to": to,
         "type": "interactive",
@@ -78,13 +394,25 @@ async def send_list(to: str, body: str, button_label: str, section_title: str, r
             "body": {"text": body},
             "action": {
                 "button": button_label[:20],
-                "sections": [{"title": section_title[:24], "rows": rows[:10]}],
+                "sections": [{"title": section_title[:24], "rows": sliced_rows}],
             },
         },
     })
 
 
 async def send_location_request(to: str, body: str) -> bool:
+    if settings.dry_run:
+        return await _send({
+            "to": to,
+            "type": "interactive",
+            "interactive": {
+                "type": "location_request_message",
+                "body": {"text": body[:1024]},
+                "action": {"name": "send_location"},
+            },
+        })
+    if _is_evolution():
+        return await send_text(to, body)
     return await _send({
         "to": to,
         "type": "interactive",
@@ -97,14 +425,27 @@ async def send_location_request(to: str, body: str) -> bool:
 
 
 async def download_media(media_id: str) -> tuple[bytes, str]:
-    """Two-step fetch: media id -> temporary URL -> bytes (both need the access token).
-
-    Returns (content, mime_type). In dry-run mode there is no real WhatsApp
-    media to fetch, so this returns an empty payload the caller should treat
-    as "no preview available".
-    """
+    """Fetch receipt media bytes and mime_type for either Evolution API or Meta Cloud API."""
     if settings.dry_run:
         return b"", "application/octet-stream"
+    if _is_evolution():
+        cached = _MEDIA_CACHE.pop(media_id, None)
+        if cached is not None:
+            return cached
+        base_url = settings.evolution_api_url.rstrip("/")
+        instance = settings.evolution_instance.strip("/")
+        url = f"{base_url}/chat/getBase64FromMediaMessage/{instance}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                url,
+                headers=_evolution_headers(),
+                json={"message": {"key": {"id": media_id}}, "convertToMp4": False},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw_b64 = (data.get("base64") or "").split(",", 1)[-1].strip()
+            mime_type = data.get("mimetype") or data.get("mimeType") or "image/jpeg"
+            return (base64.b64decode(raw_b64) if raw_b64 else b""), mime_type
     async with httpx.AsyncClient(timeout=30) as client:
         meta = await client.get(f"{GRAPH}/{settings.whatsapp_api_version}/{media_id}", headers=_headers())
         meta.raise_for_status()
@@ -114,8 +455,243 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         return file.content, meta_json.get("mime_type", "application/octet-stream")
 
 
+def _extract_poll_selections(item: dict) -> list[tuple[str, str | None, str | None, bool | None]]:
+    """Extract `(selected_option, vote_key_id, voter_jid, from_me)` tuples from an Evolution update/upsert item."""
+    results: list[tuple[str, str | None, str | None, bool | None]] = []
+
+    def _collect_from_poll_updates(poll_updates: Any) -> None:
+        if not isinstance(poll_updates, list):
+            return
+        for pu in poll_updates:
+            if not isinstance(pu, dict):
+                continue
+            pu_key = pu.get("pollUpdateMessageKey") if isinstance(pu.get("pollUpdateMessageKey"), dict) else {}
+            pu_id = pu_key.get("id")
+            pu_jid = pu_key.get("remoteJid") or pu.get("voter")
+            pu_from_me = pu_key.get("fromMe") if "fromMe" in pu_key else None
+            vote = pu.get("vote")
+            selected: list[Any] = []
+            if isinstance(vote, dict):
+                selected = vote.get("selectedOptions") or vote.get("options") or []
+            elif isinstance(vote, list):
+                selected = vote
+            elif isinstance(pu.get("selectedOptions"), list):
+                selected = pu["selectedOptions"]
+            for opt in selected:
+                opt_str = opt.get("name") if isinstance(opt, dict) else str(opt)
+                if opt_str and opt_str.strip():
+                    results.append((opt_str.strip(), pu_id, pu_jid, pu_from_me))
+
+    update_obj = item.get("update") if isinstance(item.get("update"), dict) else {}
+    msg_obj = item.get("message") if isinstance(item.get("message"), dict) else {}
+
+    _collect_from_poll_updates(update_obj.get("pollUpdates"))
+    _collect_from_poll_updates(item.get("pollUpdates"))
+
+    for container in (
+        update_obj.get("pollUpdateMessage"),
+        msg_obj.get("pollUpdateMessage"),
+        update_obj,
+        item,
+    ):
+        if not isinstance(container, dict):
+            continue
+        vote = container.get("vote")
+        selected = (
+            vote.get("selectedOptions")
+            if isinstance(vote, dict)
+            else container.get("selectedOptions")
+        )
+        if isinstance(selected, list) and not results:
+            for opt in selected:
+                opt_str = opt.get("name") if isinstance(opt, dict) else str(opt)
+                if opt_str and opt_str.strip():
+                    results.append((opt_str.strip(), None, None, None))
+
+    return results
+
+
+def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
+    """Parse Evolution API v2 `messages.upsert` and `messages.update` webhook payloads."""
+    raw_event = str(payload.get("event") or "").strip().lower().replace("_", ".")
+    if raw_event not in {"messages.upsert", "messages.update"}:
+        return []
+
+    raw_data = payload.get("data")
+    if isinstance(raw_data, list):
+        items = [d for d in raw_data if isinstance(d, dict)]
+    elif isinstance(raw_data, dict):
+        if isinstance(raw_data.get("messages"), list):
+            items = [d for d in raw_data["messages"] if isinstance(d, dict)]
+        else:
+            items = [raw_data]
+    else:
+        return []
+
+    out: list[IncomingMessage] = []
+
+    for item in items:
+        key = item.get("key") if isinstance(item.get("key"), dict) else {}
+        from_me = key.get("fromMe") if "fromMe" in key else item.get("fromMe", False)
+        if from_me is True:
+            continue
+
+        remote_jid = key.get("remoteJid") or item.get("remoteJid") or ""
+        key_id = str(key.get("id") or item.get("keyId") or "").strip()
+
+        if raw_event == "messages.update":
+            poll_selections = _extract_poll_selections(item)
+            if not poll_selections:
+                continue
+            for selected_option, vote_key_id, voter_jid, vote_from_me in poll_selections:
+                if vote_from_me is True:
+                    continue
+                effective_jid = remote_jid or (voter_jid or "")
+                if not isinstance(effective_jid, str) or not effective_jid.endswith("@s.whatsapp.net"):
+                    continue
+                dedup_id = key_id or (vote_key_id or "")
+                if not dedup_id or SEEN_MESSAGE_IDS.add_or_seen(dedup_id):
+                    continue
+                phone = _clean_phone(effective_jid)
+                resolved_id = resolve_menu_selection(phone, selected_option)
+                if resolved_id is not None:
+                    out.append(
+                        IncomingMessage(
+                            id=dedup_id,
+                            sender=phone,
+                            type="interactive",
+                            text=selected_option,
+                            reply_id=resolved_id,
+                        )
+                    )
+                else:
+                    out.append(
+                        IncomingMessage(
+                            id=dedup_id,
+                            sender=phone,
+                            type="text",
+                            text=selected_option,
+                            reply_id=None,
+                        )
+                    )
+            continue
+
+        # messages.upsert
+        if not isinstance(remote_jid, str) or not remote_jid.endswith("@s.whatsapp.net"):
+            continue
+        phone = _clean_phone(remote_jid)
+        msg_obj = item.get("message") if isinstance(item.get("message"), dict) else {}
+
+        # Poll vote arriving via messages.upsert
+        poll_selections = _extract_poll_selections(item)
+        if poll_selections:
+            for selected_option, vote_key_id, _, vote_from_me in poll_selections:
+                if vote_from_me is True:
+                    continue
+                dedup_id = key_id or (vote_key_id or "")
+                if not dedup_id or SEEN_MESSAGE_IDS.add_or_seen(dedup_id):
+                    continue
+                resolved_id = resolve_menu_selection(phone, selected_option)
+                out.append(
+                    IncomingMessage(
+                        id=dedup_id,
+                        sender=phone,
+                        type="interactive" if resolved_id is not None else "text",
+                        text=selected_option,
+                        reply_id=resolved_id,
+                    )
+                )
+            continue
+
+        # Image message (payment receipt upload)
+        if "imageMessage" in msg_obj or item.get("messageType") == "imageMessage":
+            if not key_id or SEEN_MESSAGE_IDS.add_or_seen(key_id):
+                continue
+            img_obj = msg_obj.get("imageMessage") if isinstance(msg_obj.get("imageMessage"), dict) else {}
+            inline_b64 = msg_obj.get("base64") or item.get("base64") or img_obj.get("base64")
+            if isinstance(inline_b64, str) and inline_b64:
+                _cache_inline_media(key_id, inline_b64, img_obj.get("mimetype") or "image/jpeg")
+            out.append(IncomingMessage(id=key_id, sender=phone, type="image", media_id=key_id))
+            continue
+
+        # Location message (delivery pin)
+        loc_obj = msg_obj.get("locationMessage") or msg_obj.get("liveLocationMessage")
+        if isinstance(loc_obj, dict) and "degreesLatitude" in loc_obj and "degreesLongitude" in loc_obj:
+            if not key_id or SEEN_MESSAGE_IDS.add_or_seen(key_id):
+                continue
+            out.append(
+                IncomingMessage(
+                    id=key_id,
+                    sender=phone,
+                    type="location",
+                    latitude=float(loc_obj["degreesLatitude"]),
+                    longitude=float(loc_obj["degreesLongitude"]),
+                    location_name=loc_obj.get("name"),
+                    location_address=loc_obj.get("address"),
+                )
+            )
+            continue
+
+        # Text / button / list reply extraction
+        text: str | None = None
+        explicit_reply_id: str | None = None
+
+        if isinstance(msg_obj.get("conversation"), str):
+            text = msg_obj["conversation"]
+        elif isinstance(msg_obj.get("extendedTextMessage"), dict) and isinstance(
+            msg_obj["extendedTextMessage"].get("text"), str
+        ):
+            text = msg_obj["extendedTextMessage"]["text"]
+        elif isinstance(msg_obj.get("buttonsResponseMessage"), dict):
+            btn_resp = msg_obj["buttonsResponseMessage"]
+            explicit_reply_id = btn_resp.get("selectedButtonId")
+            text = btn_resp.get("selectedDisplayText")
+        elif isinstance(msg_obj.get("listResponseMessage"), dict):
+            list_resp = msg_obj["listResponseMessage"]
+            single = list_resp.get("singleSelectReply") if isinstance(list_resp.get("singleSelectReply"), dict) else {}
+            explicit_reply_id = single.get("selectedRowId")
+            text = list_resp.get("title")
+        elif isinstance(item.get("text"), str):
+            text = item["text"]
+
+        if text is None and explicit_reply_id is None:
+            continue
+
+        if not key_id or SEEN_MESSAGE_IDS.add_or_seen(key_id):
+            continue
+
+        resolved_id = explicit_reply_id or resolve_menu_selection(phone, text)
+        if resolved_id is not None:
+            out.append(
+                IncomingMessage(
+                    id=key_id,
+                    sender=phone,
+                    type="interactive",
+                    text=text,
+                    reply_id=resolved_id,
+                )
+            )
+        else:
+            out.append(
+                IncomingMessage(
+                    id=key_id,
+                    sender=phone,
+                    type="text",
+                    text=text,
+                    reply_id=None,
+                )
+            )
+
+    return out
+
+
 def parse_incoming(payload: dict) -> list[IncomingMessage]:
-    """Flatten Meta's nested webhook payload into IncomingMessage objects (ignores status updates)."""
+    """Flatten either Evolution API v2 or Meta Cloud API webhook payloads into IncomingMessage objects."""
+    if not isinstance(payload, dict):
+        return []
+    if "event" in payload or ("data" in payload and "entry" not in payload):
+        return _parse_evolution_incoming(payload)
+
     out: list[IncomingMessage] = []
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):

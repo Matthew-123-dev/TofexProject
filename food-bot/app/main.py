@@ -40,15 +40,30 @@ if settings.is_production:
         problems.append("STAFF_PASSWORD must be set to a strong value (10+ characters)")
     if len(settings.session_secret) < 32 or settings.session_secret.startswith("replace-with"):
         problems.append("SESSION_SECRET must be a long random value (32+ characters)")
-    if not settings.whatsapp_app_secret:
-        problems.append("WHATSAPP_APP_SECRET must be set so webhook signatures can be verified")
-    if settings.whatsapp_verify_token == "change-me":
-        problems.append("WHATSAPP_VERIFY_TOKEN must not be the default value")
+    provider = settings.whatsapp_provider.strip().lower()
+    if provider == "meta":
+        if not settings.whatsapp_app_secret:
+            problems.append("WHATSAPP_APP_SECRET must be set so webhook signatures can be verified")
+        if settings.whatsapp_verify_token == "change-me":
+            problems.append("WHATSAPP_VERIFY_TOKEN must not be the default value")
+    elif provider == "evolution":
+        if not settings.evolution_api_url:
+            problems.append("EVOLUTION_API_URL must be set when WHATSAPP_PROVIDER=evolution")
+        if not settings.evolution_api_key:
+            problems.append("EVOLUTION_API_KEY must be set when WHATSAPP_PROVIDER=evolution")
+        if not settings.evolution_instance:
+            problems.append("EVOLUTION_INSTANCE must be set when WHATSAPP_PROVIDER=evolution")
+    else:
+        problems.append(f"Unsupported WHATSAPP_PROVIDER: {settings.whatsapp_provider!r}")
     if settings.database_url.startswith("sqlite"):
         logger.warning("Production is using SQLite. Use PostgreSQL: SQLite files can be lost when the app redeploys.")
     if problems:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
-elif settings.dry_run is False and not settings.whatsapp_app_secret:
+elif (
+    settings.dry_run is False
+    and settings.whatsapp_provider.strip().lower() == "meta"
+    and not settings.whatsapp_app_secret
+):
     logger.warning("WHATSAPP_APP_SECRET is not set: incoming webhooks will be rejected (only DRY_RUN skips the check).")
 
 

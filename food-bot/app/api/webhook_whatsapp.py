@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import logging
+from typing import Any
 
 from sqlalchemy.exc import IntegrityError
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Query, Request
@@ -11,6 +12,7 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models import ProcessedMessage
 from app.services import state_machine, whatsapp
+from app.services.whatsapp import BoundedTTLCache, LAST_MENU_MAP, SEEN_MESSAGE_IDS
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,6 +27,14 @@ def _signature_ok(raw: bytes, header: str | None) -> bool:
     return hmac.compare_digest(expected, header.removeprefix("sha256="))
 
 
+def _is_evolution_webhook(payload: Any) -> bool:
+    if settings.whatsapp_provider.strip().lower() != "evolution":
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return "event" in payload or ("data" in payload and "entry" not in payload)
+
+
 @router.get("/webhook/whatsapp")
 async def verify(
     mode: str = Query("", alias="hub.mode"),
@@ -37,16 +47,27 @@ async def verify(
 
 
 @router.post("/webhook/whatsapp")
+@router.post("/webhook/whatsapp/{event_name}")
 async def receive(
     request: Request,
     background: BackgroundTasks,
+    event_name: str | None = None,
     x_hub_signature_256: str | None = Header(default=None),
 ) -> dict[str, str]:
     raw = await request.body()
-    if not _signature_ok(raw, x_hub_signature_256):
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+
+    if isinstance(payload, dict) and event_name and "event" not in payload:
+        payload["event"] = event_name.replace("-", ".")
+
+    if not _is_evolution_webhook(payload) and not _signature_ok(raw, x_hub_signature_256):
         raise HTTPException(status_code=403, detail="Bad signature")
-    background.add_task(process_payload, json.loads(raw))
-    return {"status": "received"}  # return 200 fast; Meta retries slow responses
+
+    background.add_task(process_payload, payload)
+    return {"status": "received"}  # return 200 fast; webhook providers retry slow responses
 
 
 FALLBACK_REPLY = "Sorry, something went wrong on our side. Please try again, or send *menu* to start over."
@@ -58,7 +79,7 @@ async def process_payload(payload: dict) -> None:
         for msg in messages:
             try:
                 session.add(ProcessedMessage(message_id=msg.id))
-                await session.commit()  # mark first so Meta's retries are ignored
+                await session.commit()  # mark first so webhook retries are ignored
             except IntegrityError:
                 await session.rollback()
                 continue  # duplicate delivery

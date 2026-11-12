@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     app_env: str = "development"
     database_url: str = "sqlite+aiosqlite:///./foodbot.db"
 
+    whatsapp_provider: str = "evolution"
+    evolution_api_url: str = ""
+    evolution_api_key: str = ""
+    evolution_instance: str = ""
+
     whatsapp_access_token: str = ""
     whatsapp_phone_number_id: str = ""
     whatsapp_verify_token: str = "change-me"
