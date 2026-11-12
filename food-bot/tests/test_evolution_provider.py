@@ -135,6 +135,58 @@ async def test_evolution_outbound_text_media_and_polls(monkeypatch):
     assert whatsapp.LAST_MENU_MAP[phone]["2. drinks"] == "cat:Drinks"
     assert whatsapp.LAST_MENU_MAP[phone]["DRINKS"] == "cat:Drinks"
 
+    # 5. Single-option send_list + single-option send_buttons (show_carts / checkout transition)
+    #    must pad to 2 options so Evolution sendPoll never fails with HTTP 400 (min length 2).
+    assert await whatsapp.send_list(
+        phone,
+        "Tap a cart to select or unselect it, then choose Checkout.",
+        "Select carts",
+        "Your carts",
+        [{"id": "cart:1", "title": "✓ Cart 1", "description": "2 item(s), ₦3,000"}],
+    ) is True
+    assert calls[-1]["url"] == "https://evolution.railway.app/message/sendPoll/tofex-main"
+    assert calls[-1]["json"]["values"] == ["1. ✓ Cart 1", "2. Browse menu"]
+
+    assert await whatsapp.send_buttons(
+        phone,
+        "When ready, check out the selected carts.",
+        [("checkout", "Checkout")],
+    ) is True
+    assert calls[-1]["url"] == "https://evolution.railway.app/message/sendPoll/tofex-main"
+    assert calls[-1]["json"]["values"] == ["1. Checkout", "2. Browse menu"]
+    assert whatsapp.LAST_MENU_MAP[phone]["1"] == "checkout"
+    assert whatsapp.LAST_MENU_MAP[phone]["1. Checkout"] == "checkout"
+    assert whatsapp.LAST_MENU_MAP[phone]["checkout"] == "checkout"
+    assert whatsapp.LAST_MENU_MAP[phone]["2"] == "menu"
+    assert whatsapp.LAST_MENU_MAP[phone]["2. Browse menu"] == "menu"
+    # Tapping the preceding cart list poll option also still resolves!
+    assert whatsapp.LAST_MENU_MAP[phone]["1. ✓ Cart 1"] == "cart:1"
+    assert whatsapp.LAST_MENU_MAP[phone]["✓ cart 1"] == "cart:1"
+
+    # 6. Single-option address skip button pads with ("cancel", "Cancel order")
+    assert await whatsapp.send_buttons(
+        phone,
+        "You can share your location now, or skip this step.",
+        [("address:skip_pin", "Skip")],
+    ) is True
+    assert calls[-1]["url"] == "https://evolution.railway.app/message/sendPoll/tofex-main"
+    assert calls[-1]["json"]["values"] == ["1. Skip", "2. Cancel order"]
+    assert whatsapp.LAST_MENU_MAP[phone]["1"] == "address:skip_pin"
+    assert whatsapp.LAST_MENU_MAP[phone]["2"] == "cancel"
+
+    # 7. Empty (0 options) and >12 options fall back to /message/sendText/{instance}
+    assert await whatsapp.send_buttons(phone, "Empty buttons fallback", []) is True
+    assert calls[-1]["url"] == "https://evolution.railway.app/message/sendText/tofex-main"
+    assert calls[-1]["json"]["text"] == "Empty buttons fallback"
+
+    many_rows = [{"id": f"item:{i}", "title": f"Item {i}"} for i in range(1, 15)]
+    assert await whatsapp.send_list(phone, "Choose from 14 items:", "Choose", "Items", many_rows) is True
+    assert calls[-1]["url"] == "https://evolution.railway.app/message/sendText/tofex-main"
+    assert "1. Item 1" in calls[-1]["json"]["text"]
+    assert "14. Item 14" in calls[-1]["json"]["text"]
+    assert whatsapp.LAST_MENU_MAP[phone]["14"] == "item:14"
+    assert whatsapp.LAST_MENU_MAP[phone]["item 14"] == "item:14"
+
 
 @pytest.mark.asyncio
 async def test_meta_outbound_kept_intact(monkeypatch):

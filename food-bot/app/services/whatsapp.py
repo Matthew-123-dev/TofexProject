@@ -141,6 +141,22 @@ def _cache_inline_media(media_id: str, raw_b64: str, mime_type: str = "image/jpe
         _MEDIA_CACHE.popitem(last=False)
 
 
+def _ensure_poll_options(options: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Pad a 1-option menu with a context-appropriate second action so WhatsApp Polls (>=2 options) succeed."""
+    if len(options) != 1:
+        return list(options)
+    first_id, first_title = options[0]
+    if first_id.startswith("address:") or first_id == "area:other":
+        second = ("cancel", "Cancel order")
+    elif first_id.startswith("r:"):
+        second = ("help", "Help")
+    elif first_id == "menu" or first_title.strip().lower() in {"browse menu", "main menu"}:
+        second = ("carts", "View carts")
+    else:
+        second = ("menu", "Browse menu")
+    return [(first_id, first_title), second]
+
+
 def _populate_menu_map(
     to: str,
     options: list[tuple[str, str]],
@@ -160,8 +176,9 @@ def _populate_menu_map(
             if not existing_key.isdigit():
                 mapping[existing_key] = existing_val
 
+    effective_options = _ensure_poll_options(options)
     poll_values: list[str] = []
-    for idx, (opt_id, raw_title) in enumerate(options, start=1):
+    for idx, (opt_id, raw_title) in enumerate(effective_options, start=1):
         title = (raw_title or "").strip()
         numbered = f"{idx}. {title}"
         poll_values.append(numbered)
@@ -307,6 +324,28 @@ async def send_media(
     })
 
 
+async def _send_evolution_poll_or_text(to: str, body: str, poll_values: list[str]) -> bool:
+    """Send a 1-tap WhatsApp Poll when 2..12 options exist, or fall back to sendText otherwise."""
+    if not poll_values:
+        return await send_text(to, body)
+    if len(poll_values) == 1:
+        option_label = poll_values[0].removeprefix("1. ").strip()
+        return await send_text(to, f"{body}\n\nReply 1 for {option_label}")
+    if len(poll_values) > 12:
+        options_text = "\n".join(poll_values)
+        return await send_text(to, f"{body}\n\n{options_text}")
+    return await _send_evolution(
+        "sendPoll",
+        {
+            "number": _clean_phone(to),
+            "name": body,
+            "selectableCount": 1,
+            "values": poll_values,
+            "delay": EVOLUTION_DELAY_MS,
+        },
+    )
+
+
 async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bool:
     """Reply buttons: WhatsApp allows at most 3 on Meta, or a 1-tap Poll on Evolution API."""
     sliced_buttons = [(i, t[:20]) for i, t in buttons[:3]]
@@ -326,16 +365,7 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
             },
         })
     if _is_evolution():
-        return await _send_evolution(
-            "sendPoll",
-            {
-                "number": _clean_phone(to),
-                "name": body,
-                "selectableCount": 1,
-                "values": poll_values,
-                "delay": EVOLUTION_DELAY_MS,
-            },
-        )
+        return await _send_evolution_poll_or_text(to, body, poll_values)
     return await _send({
         "to": to,
         "type": "interactive",
@@ -352,9 +382,10 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
 async def send_list(to: str, body: str, button_label: str, section_title: str, rows: list[dict]) -> bool:
     """List message: up to 10 rows on Meta, or a 1-tap Poll on Evolution API."""
     sliced_rows = rows[:10]
-    poll_options = [(str(r["id"]), str(r["title"])) for r in sliced_rows]
+    poll_rows = rows if _is_evolution() else sliced_rows
+    poll_options = [(str(r["id"]), str(r["title"])) for r in poll_rows]
     extra_aliases: dict[str, str] = {}
-    for idx, r in enumerate(sliced_rows, start=1):
+    for idx, r in enumerate(poll_rows, start=1):
         desc = (r.get("description") or "").strip()
         if desc:
             title = str(r["title"]).strip()
@@ -376,16 +407,7 @@ async def send_list(to: str, body: str, button_label: str, section_title: str, r
             },
         })
     if _is_evolution():
-        return await _send_evolution(
-            "sendPoll",
-            {
-                "number": _clean_phone(to),
-                "name": body,
-                "selectableCount": 1,
-                "values": poll_values,
-                "delay": EVOLUTION_DELAY_MS,
-            },
-        )
+        return await _send_evolution_poll_or_text(to, body, poll_values)
     return await _send({
         "to": to,
         "type": "interactive",
