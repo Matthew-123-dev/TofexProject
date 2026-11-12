@@ -72,11 +72,49 @@ async def add_to_cart(
     await session.flush()
 
 
+async def remove_from_cart(session: AsyncSession, cart_id: int, item_id: int) -> None:
+    await session.execute(
+        delete(CartItem).where(CartItem.cart_id == cart_id, CartItem.item_id == item_id)
+    )
+    await session.flush()
+
+
+async def clear_cart(session: AsyncSession, cart_id: int) -> None:
+    await session.execute(delete(CartItem).where(CartItem.cart_id == cart_id))
+    await session.flush()
+
+
+async def clear_user_carts(session: AsyncSession, user_id: int) -> None:
+    carts = await get_carts(session, user_id)
+    if carts:
+        cart_ids = [c.id for c in carts]
+        await session.execute(delete(CartItem).where(CartItem.cart_id.in_(cart_ids)))
+        for c in carts:
+            c.is_selected = False
+        await session.flush()
+
+
 async def get_cart(session: AsyncSession, cart_id: int) -> list[tuple[CartItem, MenuItem]]:
     result = await session.execute(
         select(CartItem, MenuItem).join(MenuItem, MenuItem.id == CartItem.item_id).where(CartItem.cart_id == cart_id)
     )
     return [(c, m) for c, m in result.all()]
+
+
+async def get_user_cart_summary(session: AsyncSession, user_id: int) -> tuple[int, Decimal]:
+    """Return `(total_items, subtotal)` across the user's selected (or active) carts."""
+    carts = await get_carts(session, user_id)
+    if not carts:
+        return 0, Decimal("0")
+    selected = [c for c in carts if c.is_selected]
+    target_carts = selected if selected else carts
+    total_qty = 0
+    total_sub = Decimal("0")
+    for c in target_carts:
+        lines = await get_cart(session, c.id)
+        total_qty += sum(ci.quantity for ci, _ in lines)
+        total_sub += cart_subtotal(lines)
+    return total_qty, total_sub
 
 
 async def get_selected_cart_ids(session: AsyncSession, user_id: int) -> list[int]:
@@ -134,6 +172,39 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     await session.execute(delete(CartItem).where(CartItem.cart_id.in_([cart_id for cart_id, _ in cart_lines])))
     await session.flush()
     return batch
+
+
+async def restore_cart_from_batch(session: AsyncSession, user: User, batch: PaymentBatch) -> Cart:
+    """Restore items from an unconfirmed checkout batch back into the user's active cart."""
+    cart = await get_or_create_cart(session, user.id)
+    await clear_cart(session, cart.id)
+    for order in batch.orders:
+        for oi in order.items:
+            await add_to_cart(session, user.id, oi.item_id, quantity=oi.quantity, cart_id=cart.id)
+    cart.is_selected = True
+    await session.flush()
+    return cart
+
+
+async def get_last_order(session: AsyncSession, user_id: int) -> Order | None:
+    """Fetch the customer's most recent order (preferring PAID, otherwise most recent order with items)."""
+    paid_result = await session.execute(
+        _order_query()
+        .where(Order.user_id == user_id, Order.status == OrderStatus.PAID)
+        .order_by(Order.id.desc())
+        .limit(1)
+    )
+    paid = paid_result.scalar_one_or_none()
+    if paid is not None and paid.items:
+        return paid
+    any_result = await session.execute(
+        _order_query()
+        .where(Order.user_id == user_id)
+        .order_by(Order.id.desc())
+        .limit(1)
+    )
+    order = any_result.scalar_one_or_none()
+    return order if (order is not None and order.items) else None
 
 
 def _check_stock(cart_lines: list[tuple[int, list[tuple[CartItem, MenuItem]]]]) -> None:

@@ -6,13 +6,103 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MenuItem, Order
 
+# Customer-facing category labels (Principle 3: Recognition over recall)
+CATEGORY_DISPLAY_NAMES: dict[str, str] = {
+    "Food": "🍛 Rice, Spaghetti & Porridge",
+    "Snacks": "🌯 Shawarma & Snacks",
+    "Protein 2": "🍗 Grilled Chicken",
+    "Protein 3": "🦃 Grilled Turkey",
+    "Protein 1": "🥩 Beef, Fish & Extras",
+    "Drinks": "🥤 Cold Drinks",
+    "Icecream": "🍦 Ice Cream",
+}
+
+CATEGORY_SORT_ORDER: list[str] = [
+    "Food",
+    "Snacks",
+    "Protein 2",
+    "Protein 3",
+    "Protein 1",
+    "Drinks",
+    "Icecream",
+]
+
+# Customer-facing item labels for abbreviated database names
+ITEM_DISPLAY_NAMES: dict[str, str] = {
+    "Plantain (1)": "Plantain (1 portion)",
+    "Chicken (1)": "Chicken Small (1)",
+    "Chicken (2)": "Chicken Medium (2)",
+    "Chicken (3)": "Chicken Large (3)",
+    "Chicken (4)": "Chicken XL (4)",
+    "Chicken (5)": "Chicken XXL (5)",
+    "Turkey (1)": "Turkey Small (1)",
+    "Turkey (2)": "Turkey Medium (2)",
+    "Turkey (3)": "Turkey Large (3)",
+    "Turkey (4)": "Turkey XL (4)",
+    "Turkey (5)": "Turkey XXL (5)",
+    "Shawama (1200)": "Shawarma (Regular)",
+    "Shawama (2000)": "Shawarma (Large)",
+    "Popcorn (200)": "Popcorn (Small)",
+    "Popcorn (300)": "Popcorn (Large)",
+    "Medium": "Medium cup",
+    "1/2 liter": "Half-liter tub",
+}
+
+# Popularity order per category so the most popular items appear first in each poll
+ITEM_POPULARITY_ORDER: dict[str, list[str]] = {
+    "Food": ["Jollof rice", "Fried rice", "Spaghetti", "Porridge", "Moimoi", "Plantain (1)"],
+    "Snacks": ["Shawama (1200)", "Shawama (2000)", "Meatpie", "Eggroll", "Popcorn (200)", "Popcorn (300)"],
+    "Protein 2": ["Chicken (1)", "Chicken (2)", "Chicken (3)", "Chicken (4)", "Chicken (5)"],
+    "Protein 3": ["Turkey (1)", "Turkey (2)", "Turkey (3)", "Turkey (4)", "Turkey (5)"],
+    "Protein 1": ["Beef", "Fish (Medium)", "Fish (Big)", "Salad", "Egg", "Ponmo"],
+    "Drinks": [
+        "Coke",
+        "Fanta",
+        "Sprite",
+        "Pepsi",
+        "Bottle water",
+        "Hollandia",
+        "Exotic",
+        "Active",
+        "Pulpy orange",
+        "Berryblast",
+        "Can malt",
+        "Plastic malt",
+        "Freshyo",
+        "Vijuchoco",
+        "Nutrichoco",
+        "Nutrimilk",
+        "Fearless",
+        "Lucozade",
+        "Cola",
+    ],
+    "Icecream": ["Small cup", "Medium", "Big cup", "1/2 liter"],
+}
+
+
+def friendly_category_name(category: str) -> str:
+    """Return a customer-friendly category label with emoji."""
+    return CATEGORY_DISPLAY_NAMES.get(category, category)
+
+
+def friendly_item_name(item_name: str) -> str:
+    """Return a customer-friendly item label."""
+    return ITEM_DISPLAY_NAMES.get(item_name, item_name)
+
+
+def sort_categories(categories: list[str]) -> list[str]:
+    """Order known categories by meal popularity first, followed by any custom categories alphabetically."""
+    order_map = {name: idx for idx, name in enumerate(CATEGORY_SORT_ORDER)}
+    return sorted(categories, key=lambda c: (order_map.get(c, 999), c.lower()))
+
 
 async def get_categories(session: AsyncSession) -> list[str]:
     """Only categories that still have at least one available item."""
     result = await session.execute(
         select(MenuItem.category).where(MenuItem.is_available.is_(True)).distinct().order_by(MenuItem.category)
     )
-    return list(result.scalars())
+    raw = list(result.scalars())
+    return sort_categories(raw)
 
 
 async def get_available_items(session: AsyncSession, category: str) -> list[MenuItem]:
@@ -21,7 +111,12 @@ async def get_available_items(session: AsyncSession, category: str) -> list[Menu
         .where(MenuItem.category == category, MenuItem.is_available.is_(True))
         .order_by(MenuItem.name)
     )
-    return list(result.scalars())
+    items = list(result.scalars())
+    pop_list = ITEM_POPULARITY_ORDER.get(category)
+    if not pop_list:
+        return items
+    rank = {name: idx for idx, name in enumerate(pop_list)}
+    return sorted(items, key=lambda item: (rank.get(item.name, 999), item.name.lower()))
 
 
 async def get_item(session: AsyncSession, item_id: int) -> MenuItem | None:

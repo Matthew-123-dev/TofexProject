@@ -197,7 +197,7 @@ def _populate_menu_map(
     poll_values: list[str] = []
     for idx, (opt_id, raw_title) in enumerate(effective_options, start=1):
         title = (raw_title or "").strip()
-        numbered = f"{idx}. {title}"
+        numbered = f"{idx}. {title}"[:100]
         poll_values.append(numbered)
 
         if not is_pagination_buttons:
@@ -363,9 +363,9 @@ async def _send_evolution_poll_or_text(to: str, body: str, poll_values: list[str
         "sendPoll",
         {
             "number": _clean_phone(to),
-            "name": body,
+            "name": body[:255],
             "selectableCount": 1,
-            "values": poll_values,
+            "values": [v[:100] for v in poll_values],
             "delay": EVOLUTION_DELAY_MS,
         },
     )
@@ -406,7 +406,10 @@ async def send_buttons(to: str, body: str, buttons: list[tuple[str, str]]) -> bo
 
 async def send_list(to: str, body: str, button_label: str, section_title: str, rows: list[dict]) -> bool:
     """List message: up to 10 rows on Meta, or a 1-tap Poll on Evolution API."""
-    sliced_rows = rows[:10]
+    sliced_rows = [
+        {"id": r["id"], "title": str(r["title"])[:24], **({"description": r["description"]} if r.get("description") else {})}
+        for r in rows[:10]
+    ]
     poll_rows = rows if _is_evolution() else sliced_rows
     poll_options: list[tuple[str, str]] = []
     extra_aliases: dict[str, str] = {}
@@ -419,6 +422,14 @@ async def send_list(to: str, body: str, button_label: str, section_title: str, r
         if desc:
             extra_aliases[title] = row_id
             extra_aliases[f"{idx}. {title}"] = row_id
+        for alias in r.get("aliases") or ():
+            clean_alias = str(alias).strip()
+            if clean_alias:
+                extra_aliases[clean_alias] = row_id
+                extra_aliases[f"{idx}. {clean_alias}"] = row_id
+                if desc:
+                    extra_aliases[f"{clean_alias} - {desc}"] = row_id
+                    extra_aliases[f"{idx}. {clean_alias} - {desc}"] = row_id
     poll_values = _populate_menu_map(to, poll_options, kind="list", extra_aliases=extra_aliases)
 
     if settings.dry_run:
