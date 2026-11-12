@@ -146,6 +146,12 @@ async def get_available_items(session: AsyncSession, category: str) -> list[Menu
     return sorted(items, key=lambda item: (rank.get(item.name, 999), item.name.lower()))
 
 
+async def get_all_items(session: AsyncSession) -> list[MenuItem]:
+    """Return all menu items (available and sold out) so the typed-order parser can flag sold-out items."""
+    result = await session.execute(select(MenuItem).order_by(MenuItem.id))
+    return list(result.scalars())
+
+
 async def get_item(session: AsyncSession, item_id: int) -> MenuItem | None:
     return await session.get(MenuItem, item_id)
 

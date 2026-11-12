@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import quote_plus
@@ -30,7 +31,7 @@ from app.messages import (
     R1_DISPATCH, R2_PICKED_UP, R3_CONFIRM_DELIVERED, R3_DELIVERED, R5_HELP, R_ACTIVE, R_INACTIVE,
 )
 from app.schemas import IncomingMessage
-from app.services import menu_service, order_service, whatsapp
+from app.services import menu_service, order_parser, order_service, whatsapp
 from app.utils import naira, normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,68 @@ AREA_PAGE_SIZE = 5
 QUANTITY_PAGE_SIZE = 10
 MAX_CUSTOM_QUANTITY = 50
 MAX_RECEIPT_BYTES = 5 * 1024 * 1024
+TYPED_ORDER_TTL_SECONDS = 1800.0
 
-# Per-user navigation history and custom-quantity prompt state (in-memory, keyed by normalized phone)
+# Per-user navigation history, custom-quantity prompt state, and typed-order state (in-memory, keyed by phone)
 _NAV_STACK: dict[str, list[dict]] = {}
 _CUSTOM_QTY_ITEM: dict[str, int] = {}
+_TYPED_ORDER_DRAFTS: dict[str, tuple[float, order_parser.ParsedOrderDraft]] = {}
+_TYPED_ORDER_PROMPTED: set[str] = set()
+_KITCHEN_NOTES: dict[str, str] = {}
+
+
+def _get_typed_draft(phone: str) -> order_parser.ParsedOrderDraft | None:
+    """Return the active `ParsedOrderDraft` for `phone` if within TTL, else `None`."""
+    entry = _TYPED_ORDER_DRAFTS.get(phone)
+    if entry is None:
+        return None
+    ts, draft = entry
+    if time.monotonic() - ts > TYPED_ORDER_TTL_SECONDS:
+        _TYPED_ORDER_DRAFTS.pop(phone, None)
+        return None
+    return draft
+
+
+def _set_typed_draft(phone: str, draft: order_parser.ParsedOrderDraft) -> None:
+    """Store `draft` with a fresh timestamp."""
+    _TYPED_ORDER_DRAFTS[phone] = (time.monotonic(), draft)
+
+
+def _clear_typed_draft(phone: str) -> None:
+    """Clear any typed-order draft and prompt flag for `phone`."""
+    _TYPED_ORDER_DRAFTS.pop(phone, None)
+    _TYPED_ORDER_PROMPTED.discard(phone)
+
+
+def _extract_kitchen_prefix(notes: str | None) -> str | None:
+    """Extract only the `Kitchen: ...` portion of a fulfillment notes string, if present."""
+    if not notes:
+        return None
+    if notes.startswith("Kitchen: "):
+        return notes.split(" | Delivery: ", 1)[0].strip() or None
+    return None
+
+
+def _extract_rider_notes(notes: str | None) -> str | None:
+    """Extract only the rider/delivery portion of a fulfillment notes string (excluding `Kitchen: ...`)."""
+    if not notes:
+        return None
+    if notes.startswith("Kitchen: "):
+        if " | Delivery: " in notes:
+            return notes.split(" | Delivery: ", 1)[1].strip() or None
+        return None
+    return notes
+
+
+def _merge_kitchen_and_rider_notes(existing_notes: str | None, rider_note: str | None) -> str | None:
+    """Combine any existing `Kitchen: ...` note with a delivery/rider note."""
+    kitchen_part = _extract_kitchen_prefix(existing_notes)
+    rider_clean = (rider_note or "").strip() or None
+    if kitchen_part and rider_clean:
+        return f"{kitchen_part} | Delivery: {rider_clean}"[:200]
+    if kitchen_part:
+        return kitchen_part[:200]
+    return rider_clean[:200] if rider_clean else None
 
 # While a customer is in these stages the conversation belongs to the checkout:
 # the only way out is `cancel` or `back`.
@@ -200,6 +259,8 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     if rid == "cancel" or text in CANCEL_COMMANDS:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _NAV_STACK.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
+        _KITCHEN_NOTES.pop(user.phone_number, None)
         if session is not None:
             await order_service.clear_user_carts(session, user.id)
         user.current_state = SessionState.BROWSING
@@ -228,9 +289,24 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     if text in GREETINGS or rid == "menu":
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
         return await handle_menu_request(session, user)
+    if rid in {"typeorder:start", "typeorder:retype"}:
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        return await prompt_typed_order(user)
+    if rid.startswith("typeorder:mode:"):
+        return await handle_typed_order_mode(session, user, rid.removeprefix("typeorder:mode:"))
+    if rid.startswith("typeorder:pick:"):
+        return await handle_typed_order_pick(session, user, rid.removeprefix("typeorder:pick:"))
+    if rid == "typeorder:skip":
+        return await handle_typed_order_skip(session, user)
+    if rid.startswith("typeorder:alt:"):
+        return await handle_typed_order_alt(session, user, rid.removeprefix("typeorder:alt:"))
+    if rid == "typeorder:confirm":
+        return await handle_typed_order_confirm(session, user)
     if rid == "repeat:last" or text in {"repeat", "repeat last order", "repeat order"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
         return await handle_repeat_last_order(session, user)
     if rid.startswith("notreceived:"):
         batch_text = rid.removeprefix("notreceived:")
@@ -253,6 +329,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await handle_category_selected(session, user, category, int(page_text))
     if rid.startswith("cat:"):
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
         return await handle_category_selected(session, user, rid.removeprefix("cat:"))
     if rid.startswith("add:"):
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
@@ -276,6 +353,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await handle_add_item(session, user, int(quantity_parts[0]), int(quantity_parts[1]))
     if rid == "carts" or text in {"cart", "carts"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
         return await show_carts(session, user)
     if rid.startswith("rmitem:"):
         item_id_text = rid.removeprefix("rmitem:")
@@ -284,6 +362,8 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
             await order_service.remove_from_cart(session, cart.id, int(item_id_text))
         return await show_carts(session, user)
     if rid == "clearcart" or text in {"clear cart", "clearcart"}:
+        _clear_typed_draft(user.phone_number)
+        _KITCHEN_NOTES.pop(user.phone_number, None)
         if session is not None:
             await order_service.clear_user_carts(session, user.id)
         await whatsapp.send_text(user.phone_number, "🗑️ Your cart has been cleared. Send *menu* to pick new items.")
@@ -300,6 +380,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await toggle_cart(session, user, int(cart_text))
     if rid == "checkout" or text in {"checkout", "check out"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
         return await handle_checkout(session, user)
 
     if user.current_state == SessionState.AWAITING_RECEIPT and msg.type == "image" and msg.media_id:
@@ -308,14 +389,49 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     if open_fulfillment is not None:
         return await handle_checkout_flow(session, user, open_fulfillment, msg)
 
+    # Free-text typed order auto-detection during browsing / cart building
+    if not rid and raw_text and session is not None:
+        catalog = await menu_service.get_all_items(session)
+        draft = order_parser.parse_typed_order(raw_text, catalog)
+        if draft.has_any_recognition:
+            return await start_typed_order_draft(session, user, draft)
+        if user.phone_number in _TYPED_ORDER_PROMPTED:
+            _TYPED_ORDER_PROMPTED.discard(user.phone_number)
+            await whatsapp.send_text(
+                user.phone_number,
+                (
+                    "💡 I couldn't match any menu items in that message.\n"
+                    "Try typing like: *2 jollof rice, 1 chicken medium, 1 coke* — or pick from the menu below:"
+                ),
+            )
+            return await handle_menu_request(session, user, 0)
+
     await whatsapp.send_text(user.phone_number, "Hi! Send *menu* to see what's available right now.")
 
 
 async def handle_go_back_browsing(session: AsyncSession, user: User) -> None:
-    """Handle `⬅ Go back` (`nav:back` or `back`) during browsing and cart building."""
+    """Handle `⬅ Go back` (`nav:back` or `back`) during browsing, typed orders, and cart building."""
     if user.phone_number in _CUSTOM_QTY_ITEM:
         item_id = _CUSTOM_QTY_ITEM.pop(user.phone_number)
         return await show_quantity_selection(session, user, item_id)
+
+    draft = _get_typed_draft(user.phone_number)
+    if draft is not None:
+        if draft.awaiting_cart_mode:
+            _clear_typed_draft(user.phone_number)
+            return await handle_menu_request(session, user, 0)
+        if draft.followup_index > 0:
+            draft.followup_index -= 1
+            q = draft.followups[draft.followup_index]
+            order_parser.undo_followup_choice(draft, q)
+            _set_typed_draft(user.phone_number, draft)
+            return await _advance_typed_order(session, user, draft)
+        _clear_typed_draft(user.phone_number)
+        return await prompt_typed_order(user)
+
+    if user.phone_number in _TYPED_ORDER_PROMPTED:
+        _TYPED_ORDER_PROMPTED.discard(user.phone_number)
+        return await handle_menu_request(session, user, 0)
 
     prev = _pop_nav(user.phone_number)
     if prev:
@@ -663,6 +779,13 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
             "aliases": [c],
         })
 
+    if page == 0:
+        rows.append({
+            "id": "typeorder:start",
+            "title": "✍️ Type your order",
+            "description": "Type all your items in one message",
+        })
+
     if start + CATEGORY_PAGE_SIZE < len(categories):
         rows.append({"id": f"menupg:{page + 1}", "title": "More categories"})
     if page > 0:
@@ -750,6 +873,304 @@ async def handle_repeat_last_order(session: AsyncSession, user: User) -> None:
             ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
             ("cat:Drinks", "🥤 Add a Cold Drink"),
             ("menu", "🍛 Add another item"),
+            ("carts", "🛒 View / Edit cart"),
+            ("nav:back", "⬅ Go back"),
+            ("cancel", "❌ Cancel order"),
+        ],
+    )
+
+
+# ============================================================================
+# TYPED ORDER FLOW (Rule-Based + RapidFuzz Free-Text Order Parsing)
+# ============================================================================
+
+
+async def prompt_typed_order(user: User) -> None:
+    """Explicit handoff to free text when customer taps `✍️ Type your order` (Principle 8)."""
+    _TYPED_ORDER_DRAFTS.pop(user.phone_number, None)
+    _TYPED_ORDER_PROMPTED.add(user.phone_number)
+    user.current_state = SessionState.ADDING_TO_CART
+    await whatsapp.send_text(
+        user.phone_number,
+        (
+            "✍️ *TYPE YOUR ORDER BELOW (Step 2 of 6)*\n"
+            "Send all the items you want in one message.\n\n"
+            "💡 *Examples:*\n"
+            "• _2 jollof rice, 1 fried rice, 2 chicken medium, 1 plantain, 2 coke_\n"
+            "• _jollof of 800, 1 beef, 1 dodo, 1 eva water_\n"
+            "• _1 large shawarma extra pepper no sausage, 1 hollandia_\n\n"
+            "_(Or reply *BACK* to pick from the menu, or *CANCEL* to cancel)_"
+        ),
+    )
+
+
+async def start_typed_order_draft(
+    session: AsyncSession, user: User, draft: order_parser.ParsedOrderDraft
+) -> None:
+    """Begin processing a parsed free-text order draft (check existing cart first, then follow-ups)."""
+    _TYPED_ORDER_PROMPTED.discard(user.phone_number)
+    user.current_state = SessionState.ADDING_TO_CART
+    total_qty, subtotal = await order_service.get_user_cart_summary(session, user.id)
+    if total_qty > 0:
+        draft.awaiting_cart_mode = True
+        _set_typed_draft(user.phone_number, draft)
+        await whatsapp.send_buttons(
+            user.phone_number,
+            (
+                f"Step 2 of 6: You already have {total_qty} item{'s' if total_qty != 1 else ''} ({naira(subtotal)}) in your cart\n"
+                f"How should we handle your typed order?"
+            ),
+            [
+                ("typeorder:mode:add", f"➕ Add to my cart ({total_qty} item{'s' if total_qty != 1 else ''})"),
+                ("typeorder:mode:replace", "🔄 Replace my cart with this order"),
+                ("nav:back", "⬅ Go back"),
+                ("cancel", "❌ Cancel order"),
+            ],
+        )
+        return
+
+    draft.awaiting_cart_mode = False
+    draft.cart_mode = "add"
+    _set_typed_draft(user.phone_number, draft)
+    await _advance_typed_order(session, user, draft)
+
+
+async def handle_typed_order_mode(session: AsyncSession, user: User, mode: str) -> None:
+    """Handle `➕ Add to my cart` or `🔄 Replace my cart` poll answer."""
+    draft = _get_typed_draft(user.phone_number)
+    if draft is None:
+        return await prompt_typed_order(user)
+    draft.cart_mode = "replace" if mode == "replace" else "add"
+    draft.awaiting_cart_mode = False
+    _set_typed_draft(user.phone_number, draft)
+    await _advance_typed_order(session, user, draft)
+
+
+async def _advance_typed_order(
+    session: AsyncSession, user: User, draft: order_parser.ParsedOrderDraft
+) -> None:
+    """Ask the next follow-up question (up to 2 max), or show the confirmation summary & poll."""
+    if draft.followup_index < len(draft.followups):
+        idx = draft.followup_index
+        total_q = len(draft.followups)
+        q = draft.followups[idx]
+        buttons: list[tuple[str, str]] = []
+
+        if q.kind == "size":
+            body = (
+                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
+                f"Which size of *{q.family_label}* would you like for *\"{q.raw_phrase}\"*?"
+            )
+            for item_id, display_name, unit_price in q.options:
+                opt_qty = q.quantity
+                label = (
+                    f"{opt_qty}x {display_name} ({naira(unit_price * opt_qty)})"
+                    if opt_qty > 1
+                    else f"{display_name} ({naira(unit_price)})"
+                )
+                buttons.append((f"typeorder:pick:{item_id}:{opt_qty}", label))
+        elif q.kind == "naira_mismatch":
+            body = (
+                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
+                f"*{q.family_label}* doesn't divide evenly into {naira(Decimal(q.naira_amount or 0))}. Which option would you like?"
+            )
+            for opt_i, (item_id, display_name, opt_total) in enumerate(q.options):
+                opt_qty = q.quantity + opt_i
+                buttons.append((f"typeorder:pick:{item_id}:{opt_qty}", f"{display_name} ({naira(opt_total)})"))
+        else:
+            body = (
+                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
+                f"We couldn't find *\"{q.raw_phrase}\"*. Did you mean:"
+            )
+            for item_id, display_name, unit_price in q.options:
+                opt_qty = q.quantity
+                buttons.append(
+                    (f"typeorder:pick:{item_id}:{opt_qty}", f"✅ Yes, {opt_qty}x {display_name} ({naira(unit_price * opt_qty)})")
+                )
+
+        buttons.append(("typeorder:skip", f"❌ Remove \"{q.raw_phrase[:20]}\""))
+        buttons.append(("nav:back", "⬅ Go back"))
+        buttons.append(("cancel", "❌ Cancel order"))
+        await whatsapp.send_buttons(user.phone_number, body, buttons)
+        return
+
+    await _send_typed_order_confirmation(session, user, draft)
+
+
+async def handle_typed_order_pick(session: AsyncSession, user: User, payload: str) -> None:
+    """Resolve the current follow-up question with the customer's selected item and quantity."""
+    draft = _get_typed_draft(user.phone_number)
+    if draft is None:
+        return await prompt_typed_order(user)
+    parts = payload.split(":")
+    if len(parts) != 2 or not all(p.isdecimal() for p in parts):
+        return await _advance_typed_order(session, user, draft)
+    item_id, qty = int(parts[0]), int(parts[1])
+    item = await menu_service.get_item(session, item_id)
+    if draft.followup_index < len(draft.followups):
+        q = draft.followups[draft.followup_index]
+        if item is not None:
+            order_parser.resolve_followup_choice(draft, q, item, qty)
+        draft.followup_index += 1
+        _set_typed_draft(user.phone_number, draft)
+    await _advance_typed_order(session, user, draft)
+
+
+async def handle_typed_order_skip(session: AsyncSession, user: User) -> None:
+    """Skip/remove the ambiguous item in the current follow-up question."""
+    draft = _get_typed_draft(user.phone_number)
+    if draft is None:
+        return await prompt_typed_order(user)
+    if draft.followup_index < len(draft.followups):
+        q = draft.followups[draft.followup_index]
+        q.resolved_item_id = None
+        q.resolved_qty = 0
+        draft.followup_index += 1
+        _set_typed_draft(user.phone_number, draft)
+    await _advance_typed_order(session, user, draft)
+
+
+async def _send_typed_order_confirmation(
+    session: AsyncSession, user: User, draft: order_parser.ParsedOrderDraft
+) -> None:
+    """Send the itemized plain-text breakdown of the parsed order followed by the confirmation poll."""
+    sections: list[str] = ["📝 *WE UNDERSTOOD YOUR ORDER (Step 3 of 6)*"]
+
+    if draft.matched:
+        item_lines: list[str] = []
+        for m in draft.matched:
+            line = f"• {m.quantity} x {m.display_name} — {naira(m.subtotal)}"
+            if m.stock_capped_from is not None:
+                line += f" _(⚠️ Stock adjusted: only {m.quantity} left, from {m.stock_capped_from})_"
+            item_lines.append(line)
+        sections.append("\n".join(item_lines))
+    else:
+        sections.append("• _(No available items matched yet)_")
+
+    if draft.sold_out:
+        so_lines: list[str] = []
+        for so in draft.sold_out:
+            if so.alternatives:
+                alt_str = ", ".join(f"{a_name} ({naira(a_price)})" for _, a_name, a_price in so.alternatives)
+                so_lines.append(f"⛔ *Sold out:* {so.display_name} _(Try: {alt_str})_")
+            else:
+                so_lines.append(f"⛔ *Sold out:* {so.display_name}")
+        sections.append("\n".join(so_lines))
+
+    if draft.please_specify:
+        spec_lines = "\n".join(f"• {hint}" for hint in draft.please_specify)
+        sections.append(f"⚠️ *Please specify size/type:*\n{spec_lines}")
+
+    if draft.unmatched:
+        unmatched_str = ", ".join(f'"{u}"' for u in draft.unmatched)
+        sections.append(f"⚠️ *Couldn't find on our menu:* {unmatched_str}")
+
+    notes_summary = draft.kitchen_notes_summary()
+    if notes_summary:
+        sections.append(f"📝 *Kitchen note:* {notes_summary}")
+
+    sections.append(f"━━━━━━━━━━━━━━━━━━\n*Order Subtotal:* {naira(draft.subtotal)}")
+    await whatsapp.send_text(user.phone_number, "\n\n".join(sections))
+
+    buttons: list[tuple[str, str]] = []
+    if draft.matched:
+        buttons.append(("typeorder:confirm", f"✅ Add all to cart ({naira(draft.subtotal)})"))
+
+    seen_alt_ids: set[int] = set()
+    for so in draft.sold_out:
+        for alt_id, alt_name, alt_price in so.alternatives:
+            if alt_id not in seen_alt_ids and len(seen_alt_ids) < 2:
+                seen_alt_ids.add(alt_id)
+                buttons.append((f"typeorder:alt:{alt_id}", f"➕ Add {alt_name} instead ({naira(alt_price)})"))
+
+    buttons.append(("typeorder:retype", "✏️ Retype my order"))
+    buttons.append(("menu", "🍛 Pick from menu instead"))
+    buttons.append(("nav:back", "⬅ Go back"))
+    buttons.append(("cancel", "❌ Cancel order"))
+
+    await whatsapp.send_buttons(
+        user.phone_number,
+        "Step 3 of 6: Confirm your typed order\nTap below to add these items to your cart or make changes:",
+        buttons,
+    )
+
+
+async def handle_typed_order_alt(session: AsyncSession, user: User, alt_id_str: str) -> None:
+    """Add an in-stock category alternative for a sold-out item and refresh the confirmation screen."""
+    draft = _get_typed_draft(user.phone_number)
+    if draft is None or not alt_id_str.isdecimal():
+        return await prompt_typed_order(user)
+    alt_id = int(alt_id_str)
+    alt_item = await menu_service.get_item(session, alt_id)
+    if alt_item is not None and alt_item.is_available:
+        order_parser._add_or_merge_matched(draft, alt_item, 1, [])
+        for so in list(draft.sold_out):
+            if any(a_id == alt_id for a_id, _, _ in so.alternatives):
+                draft.sold_out.remove(so)
+                break
+        _set_typed_draft(user.phone_number, draft)
+    await _send_typed_order_confirmation(session, user, draft)
+
+
+async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
+    """Commit all confirmed items from the typed order draft into the customer's cart and show Step 4."""
+    draft = _get_typed_draft(user.phone_number)
+    if draft is None or not draft.matched:
+        return await prompt_typed_order(user)
+
+    _clear_typed_draft(user.phone_number)
+    if draft.cart_mode == "replace":
+        await order_service.clear_user_carts(session, user.id)
+        _KITCHEN_NOTES.pop(user.phone_number, None)
+
+    cart = await order_service.get_or_create_cart(session, user.id)
+    existing_lines = await order_service.get_cart(session, cart.id)
+    in_cart_map = {m.id: c.quantity for c, m in existing_lines}
+
+    added_labels: list[str] = []
+    for m in draft.matched:
+        item = await menu_service.get_item(session, m.item_id)
+        if item is None or not item.is_available:
+            continue
+        limit = item.sellable_units
+        already = in_cart_map.get(item.id, 0)
+        qty_to_add = m.quantity if limit is None else max(0, min(m.quantity, limit - already))
+        if qty_to_add <= 0:
+            continue
+        await order_service.add_to_cart(session, user.id, item.id, quantity=qty_to_add, cart_id=cart.id)
+        in_cart_map[item.id] = already + qty_to_add
+        added_labels.append(f"{qty_to_add}x {m.display_name}")
+
+    notes_summary = draft.kitchen_notes_summary()
+    if notes_summary:
+        prev_notes = _KITCHEN_NOTES.get(user.phone_number)
+        _KITCHEN_NOTES[user.phone_number] = f"{prev_notes}; {notes_summary}" if prev_notes else notes_summary
+
+    lines = await order_service.get_cart(session, cart.id)
+    subtotal = order_service.cart_subtotal(lines)
+    total_qty = sum(c.quantity for c, _ in lines)
+    user.current_state = SessionState.ADDING_TO_CART
+    _push_nav(user.phone_number, {"kind": "carts"})
+
+    added_preview = ", ".join(added_labels[:3])
+    if len(added_labels) > 3:
+        added_preview += f" +{len(added_labels) - 3} more"
+
+    await whatsapp.send_buttons(
+        user.phone_number,
+        (
+            f"Step 4 of 6: Anything else with your order?\n"
+            f"✅ Added: {added_preview or 'your items'}\n"
+            f"🛒 Cart: {total_qty} item(s) · Subtotal: {naira(subtotal)}\n"
+            f"Choose an add-on or proceed to checkout:"
+        ),
+        [
+            ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
+            ("cat:Protein 2", "🍗 Add Grilled Chicken"),
+            ("cat:Protein 3", "🦃 Add Grilled Turkey"),
+            ("cat:Protein 1", "🥩 Add Beef, Fish, Plantain or Extras"),
+            ("cat:Drinks", "🥤 Add a Cold Drink"),
+            ("menu", "🍛 Add another meal or snack"),
             ("carts", "🛒 View / Edit cart"),
             ("nav:back", "⬅ Go back"),
             ("cancel", "❌ Cancel order"),
@@ -993,6 +1414,9 @@ async def handle_checkout(session: AsyncSession, user: User) -> None:
     batch.fulfillment.checkout_step = "choice"
     batch.fulfillment.timer_started_at = now
     batch.fulfillment.reminders_sent = "[]"
+    kitchen_note = _KITCHEN_NOTES.pop(user.phone_number, None)
+    if kitchen_note:
+        batch.fulfillment.notes = f"Kitchen: {kitchen_note}"[:200]
     await session.flush()
 
     user.current_state = SessionState.COLLECTING_DETAILS
@@ -1145,6 +1569,9 @@ async def cancel_checkout(session: AsyncSession, user: User, batch: PaymentBatch
 
 async def return_checkout_to_cart(session: AsyncSession, user: User, batch: PaymentBatch, fulfillment: Fulfillment) -> None:
     """Restore items from an unconfirmed checkout batch back into the cart and open Step 4 cart view."""
+    kitchen_prefix = _extract_kitchen_prefix(fulfillment.notes)
+    if kitchen_prefix:
+        _KITCHEN_NOTES[user.phone_number] = kitchen_prefix.removeprefix("Kitchen: ").strip()
     await order_service.restore_cart_from_batch(session, user, batch)
     fulfillment.stage = FulfillmentStage.CANCELLED
     fulfillment.cancelled_at = datetime.now(timezone.utc)
@@ -1362,6 +1789,7 @@ async def save_address(session: AsyncSession, user: User, fulfillment: Fulfillme
     ).scalar_one_or_none()
     area_name = fulfillment.area_name or ""
     landmark = fulfillment.landmark or ""
+    rider_notes = _extract_rider_notes(fulfillment.notes)
     if saved is None:
         session.add(
             SavedAddress(
@@ -1371,7 +1799,7 @@ async def save_address(session: AsyncSession, user: User, fulfillment: Fulfillme
                 area_name=area_name,
                 landmark=landmark,
                 phone2=fulfillment.phone2,
-                notes=fulfillment.notes,
+                notes=rider_notes,
                 latitude=fulfillment.latitude,
                 longitude=fulfillment.longitude,
             )
@@ -1382,7 +1810,7 @@ async def save_address(session: AsyncSession, user: User, fulfillment: Fulfillme
         saved.area_name = area_name
         saved.landmark = landmark
         saved.phone2 = fulfillment.phone2
-        saved.notes = fulfillment.notes
+        saved.notes = rider_notes
         saved.latitude = fulfillment.latitude
         saved.longitude = fulfillment.longitude
     await session.flush()
@@ -1514,7 +1942,7 @@ async def process_address_step(
             fulfillment.area_name = area.name
             fulfillment.landmark = saved.landmark
             fulfillment.phone2 = saved.phone2
-            fulfillment.notes = saved.notes
+            fulfillment.notes = _merge_kitchen_and_rider_notes(fulfillment.notes, saved.notes)
             fulfillment.latitude = saved.latitude
             fulfillment.longitude = saved.longitude
             fulfillment.expected_minutes = area.expected_minutes
@@ -1605,7 +2033,7 @@ async def process_address_step(
     if step == "phone2":
         if rid == "address:fast_summary":
             fulfillment.phone2 = None
-            fulfillment.notes = None
+            fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
             fulfillment.checkout_step = "summary"
             await send_summary(session, user, fulfillment, batch=batch)
             return
@@ -1634,7 +2062,8 @@ async def process_address_step(
 
     if step == "notes":
         is_skip = lowered == "skip" or rid == "address:skip_notes"
-        fulfillment.notes = None if is_skip else text[:200]
+        rider_note = None if is_skip else text[:200]
+        fulfillment.notes = _merge_kitchen_and_rider_notes(fulfillment.notes, rider_note)
         fulfillment.checkout_step = "summary"
         await send_summary(session, user, fulfillment, batch=batch)
         return
@@ -1648,7 +2077,7 @@ async def process_address_step(
             fulfillment.street = None
             fulfillment.landmark = None
             fulfillment.phone2 = None
-            fulfillment.notes = None
+            fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
             if fulfillment.address_editing:  # after checkout the area is locked, so restart at the street
                 fulfillment.checkout_step = "street"
                 await whatsapp.send_text(user.phone_number, M2_STREET)
@@ -1679,7 +2108,7 @@ async def begin_address(session: AsyncSession, user: User, fulfillment: Fulfillm
         fulfillment.area_name = None
         fulfillment.landmark = None
         fulfillment.phone2 = None
-        fulfillment.notes = None
+        fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
     fulfillment.checkout_step = "street"
     user.current_state = SessionState.COLLECTING_DETAILS
     await whatsapp.send_text(user.phone_number, M2_STREET)
@@ -1741,8 +2170,9 @@ async def send_summary(
 
     if fulfillment.fulfillment_type == "pickup":
         total_text = naira(subtotal)
+        pickup_items = f"{items_block}\n📝 Notes: {fulfillment.notes}" if fulfillment.notes else items_block
         summary_text = M8_PICKUP_SUMMARY.format(
-            items_block=items_block,
+            items_block=pickup_items,
             outlet_address=settings.outlet_address,
             subtotal=naira(subtotal),
             total=total_text,
@@ -1874,6 +2304,7 @@ async def dispatch_fulfillment(session: AsyncSession, batch_id: int, rider_id: i
     customer = batch.orders[0].user
     order_numbers = ", ".join(str(order.id) for order in batch.orders)
     n_items = sum(sum(item.quantity for item in order.items) for order in batch.orders)
+    rider_notes = _extract_rider_notes(fulfillment.notes)
     rider_message = R1_DISPATCH.format(
         batch=batch.id,
         order_numbers=order_numbers,
@@ -1883,7 +2314,7 @@ async def dispatch_fulfillment(session: AsyncSession, batch_id: int, rider_id: i
         area=fulfillment.area_name or "",
         landmark=fulfillment.landmark or "",
         second_phone_line=f"Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else "",
-        notes_line=f"Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
+        notes_line=f"Notes: {rider_notes}\n" if rider_notes else "",
         map_link=build_map_link(fulfillment),
         n=n_items,
         m=len(batch.orders),
