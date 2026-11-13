@@ -858,6 +858,19 @@
       white-space: nowrap;
     }
 
+    .snapshot-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      padding: 10px 10px 2px;
+      border-top: 1px dashed var(--line);
+      font-size: 12px;
+      color: var(--muted-ink);
+    }
+
     /* Forms & Inputs */
     .form-grid {
       display: grid;
@@ -2023,6 +2036,46 @@ function orderCard(o) {
     </article>`;
 }
 
+function isLowStock(i) {
+  return i.stock_quantity !== null && i.stock_quantity <= (i.low_stock_threshold || 0);
+}
+
+function menuRowHtml(i, full) {
+  const lowStock = isLowStock(i);
+  const sub = full ? `<span>${esc(i.description || 'No description')}</span>` : `<span class="badge muted-pill">${esc(i.category)}</span>`;
+  return `
+    <div class="menu-row">
+      <div class="menu-info">
+        <strong>${esc(i.name)}</strong>
+        <div class="menu-meta">
+          ${sub}
+          <span class="badge ${i.is_available ? 'green' : 'crimson'}">${i.is_available ? 'Available' : 'Hidden'}</span>
+          <span class="badge ${lowStock ? 'crimson' : 'muted-pill'}">Stock: ${i.stock_quantity ?? 'untracked'}</span>
+        </div>
+      </div>
+      <div class="menu-right">
+        <span class="price">${money(i.price)}</span>
+        ${full ? `<button class="secondary btn-sm" onclick="editMenu(${i.id})">Edit</button><button class="danger btn-sm" onclick="deleteMenu(${i.id})">Delete</button>` : ''}
+      </div>
+    </div>`;
+}
+
+function pickMenuSnapshot(items, limit = 5) {
+  // Miller's law: surface up to 5 high-signal items on Overview instead of every category
+  const picked = [];
+  const seen = new Set();
+  const push = item => { if (!seen.has(item.id) && picked.length < limit) { seen.add(item.id); picked.push(item); } };
+
+  items.filter(i => !i.is_available).forEach(push);
+  items.filter(i => i.is_available && isLowStock(i)).forEach(push);
+
+  const byCategory = Object.values(items.reduce((acc, i) => ((acc[i.category] ??= []).push(i), acc), {}));
+  for (let round = 0; picked.length < limit && byCategory.some(list => round < list.length); round++) {
+    byCategory.forEach(list => { if (round < list.length) push(list[round]); });
+  }
+  return picked;
+}
+
 function menuPreview(full = false) {
   let itemsList = data.items;
   if (searchQuery) {
@@ -2032,7 +2085,29 @@ function menuPreview(full = false) {
       (i.description || '').toLowerCase().includes(searchQuery)
     );
   }
-  if (full && menuCatFilter !== 'all') {
+  if (!itemsList.length) return '<div class="empty">No matching menu items found.</div>';
+
+  if (!full) {
+    const snapshot = pickMenuSnapshot(itemsList, 5);
+    const catCount = new Set(itemsList.map(i => i.category)).size;
+    const hiddenCount = itemsList.filter(i => !i.is_available).length;
+    const lowCount = itemsList.filter(i => i.is_available && isLowStock(i)).length;
+    const summary = [
+      `Showing ${snapshot.length} of ${itemsList.length} item${itemsList.length === 1 ? '' : 's'}`,
+      `${catCount} categor${catCount === 1 ? 'y' : 'ies'}`,
+      hiddenCount ? `${hiddenCount} hidden` : '',
+      lowCount ? `${lowCount} low stock` : '',
+    ].filter(Boolean).join(' · ');
+
+    return `
+      ${snapshot.map(i => menuRowHtml(i, false)).join('')}
+      <div class="snapshot-foot">
+        <span>${summary}</span>
+        ${itemsList.length > snapshot.length ? `<a class="see-all" href="/manage-menu">View all ${itemsList.length} ›</a>` : ''}
+      </div>`;
+  }
+
+  if (menuCatFilter !== 'all') {
     itemsList = itemsList.filter(i => i.category === menuCatFilter);
   }
   const groups = {};
@@ -2041,25 +2116,7 @@ function menuPreview(full = false) {
   return Object.entries(groups).map(([cat, items]) => `
     <div class="menu-category">
       <h3>${esc(cat)}</h3>
-      ${(full ? items : items.slice(0, 3)).map(i => {
-        const lowStock = i.stock_quantity !== null && i.stock_quantity <= (i.low_stock_threshold || 0);
-        return `
-          <div class="menu-row">
-            <div class="menu-info">
-              <strong>${esc(i.name)}</strong>
-              <div class="menu-meta">
-                <span>${esc(i.description || 'No description')}</span>
-                <span class="badge ${i.is_available ? 'green' : 'crimson'}">${i.is_available ? 'Available' : 'Hidden'}</span>
-                <span class="badge ${lowStock ? 'crimson' : 'muted-pill'}">Stock: ${i.stock_quantity ?? 'untracked'}</span>
-              </div>
-            </div>
-            <div class="menu-right">
-              <span class="price">${money(i.price)}</span>
-              ${full ? `<button class="secondary btn-sm" onclick="editMenu(${i.id})">Edit</button><button class="danger btn-sm" onclick="deleteMenu(${i.id})">Delete</button>` : ''}
-            </div>
-          </div>`;
-      }).join('')}
-      ${!full && items.length > 3 ? `<div class="muted" style="font-size:12px;padding:8px 10px">+${items.length - 3} more in ${esc(cat)}</div>` : ''}
+      ${items.map(i => menuRowHtml(i, true)).join('')}
     </div>`).join('') || '<div class="empty">No matching menu items found.</div>';
 }
 
@@ -2147,13 +2204,20 @@ function render() {
   if (page === 'dashboard') {
     renderHeader(greeting(), 'A live overview of orders, kitchen prep, riders, and menu stock.');
 
-    const overviewOrders = sorted
+    const matchedOrders = sorted
       .filter(o => (active(o) || attention(o)) && matchesOrderSearch(o))
-      .sort((a, b) => Number(attention(b)) - Number(attention(a)))
-      .slice(0, 5);
+      .sort((a, b) => Number(attention(b)) - Number(attention(a)));
+    const overviewOrders = matchedOrders.slice(0, 4);
 
-    const riderList = data.riders.filter(r => !searchQuery || r.name.toLowerCase().includes(searchQuery) || r.phone_number.toLowerCase().includes(searchQuery)).slice(0, 5);
-    const areaList = data.areas.filter(a => !searchQuery || a.name.toLowerCase().includes(searchQuery)).slice(0, 5);
+    const matchedRiders = data.riders
+      .filter(r => !searchQuery || r.name.toLowerCase().includes(searchQuery) || r.phone_number.toLowerCase().includes(searchQuery))
+      .sort((a, b) => Number(b.available) - Number(a.available));
+    const riderList = matchedRiders.slice(0, 4);
+
+    const matchedAreas = data.areas
+      .filter(a => !searchQuery || a.name.toLowerCase().includes(searchQuery))
+      .sort((a, b) => Number(b.is_active) - Number(a.is_active));
+    const areaList = matchedAreas.slice(0, 4);
 
     document.querySelector('#app').innerHTML = `
       <section class="hero-carousel" id="heroCarousel">
@@ -2221,9 +2285,9 @@ function render() {
         <div class="section-head">
           <div>
             <h2>Active orders</h2>
-            <p>Urgent receipts and active deliveries appear first.</p>
+            <p>Top ${overviewOrders.length}${matchedOrders.length > overviewOrders.length ? ` of ${matchedOrders.length}` : ''} · urgent receipts first.</p>
           </div>
-          <a class="see-all" href="/orders">See All ›</a>
+          <a class="see-all" href="/orders">${matchedOrders.length > overviewOrders.length ? `See All (${matchedOrders.length}) ›` : 'See All ›'}</a>
         </div>
         <div class="grid">${overviewOrders.map(orderCard).join('') || '<div class="empty">No active orders match right now.</div>'}</div>
       </section>
@@ -2232,7 +2296,7 @@ function render() {
         <div class="section-head">
           <div>
             <h2>Menu snapshot</h2>
-            <p>Top 3 dishes per category with stock status.</p>
+            <p>Up to 5 key dishes · stock alerts shown first.</p>
           </div>
           <a class="see-all" href="/manage-menu">Manage menu ›</a>
         </div>
@@ -2245,7 +2309,7 @@ function render() {
             <h2>Riders</h2>
             <p>Active dispatch partners.</p>
           </div>
-          <a class="see-all" href="/riders">See All ›</a>
+          <a class="see-all" href="/riders">${matchedRiders.length > riderList.length ? `See All (${matchedRiders.length}) ›` : 'See All ›'}</a>
         </div>
         <div class="grid">${riderList.map(riderCard).join('') || '<div class="empty">No riders yet.</div>'}</div>
       </section>
@@ -2256,7 +2320,7 @@ function render() {
             <h2>Delivery areas</h2>
             <p>Service zones and delivery fees.</p>
           </div>
-          <a class="see-all" href="/delivery-areas">See All ›</a>
+          <a class="see-all" href="/delivery-areas">${matchedAreas.length > areaList.length ? `See All (${matchedAreas.length}) ›` : 'See All ›'}</a>
         </div>
         <div class="grid">${areaList.map(areaCard).join('') || '<div class="empty">No delivery areas yet.</div>'}</div>
       </section>
