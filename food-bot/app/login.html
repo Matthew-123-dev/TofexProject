@@ -2,14 +2,291 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in · Tofex</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Sign in · Tofex Operations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
-    :root { color-scheme: dark; --ink:#f7f3ed; --muted:#b9b0a5; --accent:#ef8064; --panel:#252322; }
-    * { box-sizing:border-box; } body { margin:0; min-height:100vh; display:grid; place-items:center; color:var(--ink); background:radial-gradient(circle at 15% 10%,#74382e 0,#211d1d 42%,#111 100%); font:15px system-ui,sans-serif; }
-    .card { width:min(420px,calc(100% - 32px)); padding:40px; border:1px solid #ffffff1c; border-radius:24px; background:#1b1918e8; box-shadow:0 24px 80px #0008; backdrop-filter:blur(16px); }
-    .brand { color:var(--accent); font-weight:800; letter-spacing:.14em; text-transform:uppercase; } h1 { margin:32px 0 8px; font:700 32px Georgia,serif; } p { color:var(--muted); line-height:1.6; } label { display:grid; gap:7px; margin:20px 0; color:var(--muted); font-weight:650; } input { padding:13px 14px; border:1px solid #ffffff24; border-radius:10px; color:var(--ink); background:#ffffff0c; font:inherit; } button { width:100%; margin-top:8px; padding:13px; border:0; border-radius:10px; color:#231716; background:var(--accent); cursor:pointer; font:700 15px inherit; } .error { padding:11px 13px; border-radius:10px; color:#ffd3ca; background:#9b382c66; }
+    :root {
+      /* Primary Logo Colors */
+      --tofex-crimson: #8B1113;
+      --tofex-amber: #DC8529;
+      --tofex-white: #FFFFFF;
+
+      /* Secondary & Campaign Colors */
+      --tofex-burgundy: #681015;
+      --tofex-terracotta: #B84D24;
+      --tofex-blaze-orange: #E8630A;
+      --tofex-challenge-gold: #F9E511;
+
+      /* Neutrals & Frosted Glass Surfaces */
+      --tofex-charcoal: #181514;
+      --tofex-espresso: #4A423F;
+      --tofex-frost-bg: rgba(245, 236, 228, 0.72);
+      --tofex-frost-border: rgba(255, 255, 255, 0.45);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      min-height: 100dvh;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      color: var(--tofex-charcoal);
+      background:
+        radial-gradient(circle at 15% 12%, rgba(232, 99, 10, 0.35) 0%, transparent 45%),
+        radial-gradient(circle at 88% 18%, rgba(220, 133, 41, 0.25) 0%, transparent 42%),
+        linear-gradient(155deg, var(--tofex-burgundy) 0%, var(--tofex-charcoal) 62%, #110E0D 100%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .stage {
+      width: min(440px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .hero {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 4px 6px;
+      color: var(--tofex-white);
+    }
+
+    .logo-mark {
+      width: 48px;
+      height: 48px;
+      border-radius: 15px;
+      background: linear-gradient(135deg, var(--tofex-crimson), var(--tofex-blaze-orange));
+      border: 1px solid var(--tofex-frost-border);
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 22px;
+      color: var(--tofex-white);
+      box-shadow: 0 12px 28px rgba(139, 17, 19, 0.45);
+      flex-shrink: 0;
+    }
+
+    .brand-eyebrow {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--tofex-amber);
+    }
+
+    .brand-title {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-top: 2px;
+    }
+
+    .sheet {
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--tofex-frost-border);
+      border-radius: 26px;
+      padding: 20px 28px 30px;
+      box-shadow: 0 28px 80px rgba(24, 21, 20, 0.45);
+    }
+
+    .sheet-handle {
+      width: 48px;
+      height: 4px;
+      border-radius: 99px;
+      background: rgba(74, 66, 63, 0.22);
+      margin: 0 auto 20px;
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--tofex-charcoal);
+    }
+
+    .subtitle {
+      margin: 0 0 22px;
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--tofex-espresso);
+    }
+
+    .error {
+      margin-bottom: 18px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--tofex-burgundy);
+      background: rgba(139, 17, 19, 0.10);
+      border: 1px solid rgba(139, 17, 19, 0.22);
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
+    }
+
+    label {
+      display: grid;
+      gap: 7px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--tofex-espresso);
+    }
+
+    input {
+      width: 100%;
+      min-height: 48px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(74, 66, 63, 0.20);
+      background: #FAF8F6;
+      color: var(--tofex-charcoal);
+      font-family: inherit;
+      font-size: 16px;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background-color 0.15s ease;
+    }
+
+    input:focus {
+      outline: none;
+      background: var(--tofex-white);
+      border-color: var(--tofex-crimson);
+      box-shadow: 0 0 0 3px rgba(139, 17, 19, 0.14);
+    }
+
+    button {
+      width: 100%;
+      min-height: 50px;
+      margin-top: 6px;
+      border: 0;
+      border-radius: 13px;
+      background: linear-gradient(135deg, var(--tofex-crimson), var(--tofex-terracotta));
+      color: var(--tofex-white);
+      font-family: inherit;
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      box-shadow: 0 10px 24px rgba(139, 17, 19, 0.28);
+      transition: transform 0.12s ease, filter 0.15s ease;
+    }
+
+    button:hover { filter: brightness(1.06); }
+    button:active { transform: scale(0.98); }
+
+    @media (max-width: 520px) {
+      body {
+        padding: 0;
+        justify-content: flex-end;
+      }
+      .stage {
+        width: 100%;
+        gap: 18px;
+      }
+      .hero {
+        padding: 28px 22px 0;
+      }
+      .sheet {
+        border-radius: 28px 28px 0 0;
+        padding: 16px 22px calc(30px + env(safe-area-inset-bottom));
+      }
+    }
+
+    /* ── Glass + motion layer ── */
+    :root { --ease-out: cubic-bezier(.22,1,.36,1); --ease-spring: cubic-bezier(.34,1.56,.64,1); --ease-inout: cubic-bezier(.65,0,.35,1); }
+    [hidden] { display: none !important; }
+    body::before, body::after { content: ""; position: fixed; border-radius: 50%; pointer-events: none; z-index: 0; }
+    body::before { width: 480px; height: 480px; left: -150px; top: -130px; background: radial-gradient(circle, rgba(232,99,10,.55), transparent 68%); }
+    body::after { width: 440px; height: 440px; right: -130px; bottom: 10%; background: radial-gradient(circle, rgba(220,133,41,.42), transparent 68%); }
+    .stage { position: relative; z-index: 1; }
+    .sheet {
+      position: relative;
+      background: linear-gradient(150deg, rgba(255,255,255,.86), rgba(255,247,240,.64));
+      -webkit-backdrop-filter: blur(28px) saturate(180%); backdrop-filter: blur(28px) saturate(180%);
+      border: 1px solid rgba(255,255,255,.55);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.95), inset 0 -1px 0 rgba(139,17,19,.07), 0 44px 90px -24px rgba(0,0,0,.6), 0 12px 30px rgba(104,16,21,.28);
+      animation: sheetPose 280ms var(--ease-out) backwards;
+    }
+    .sheet::after {
+      content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none;
+      background: linear-gradient(145deg, rgba(255,255,255,.98), rgba(255,255,255,.3) 36%, rgba(255,255,255,.08) 62%, rgba(255,255,255,.8));
+      -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+    }
+    .hero { animation: heroIn 240ms var(--ease-out) backwards; }
+    .logo-mark { box-shadow: inset 0 1px 0 rgba(255,255,255,.5), inset 0 -3px 0 rgba(0,0,0,.22), 0 12px 28px rgba(139,17,19,.5); }
+    input { transition: border-color 200ms var(--ease-out), box-shadow 200ms var(--ease-out), transform 280ms var(--ease-spring), background-color 200ms; box-shadow: inset 0 1px 2px rgba(24,21,20,.06); }
+    input:focus { transform: translateY(-1px); }
+    button {
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.4), inset 0 -3px 0 rgba(0,0,0,.2), 0 12px 24px -4px rgba(139,17,19,.45);
+      transition: transform 280ms var(--ease-spring), box-shadow 200ms var(--ease-out), filter 200ms var(--ease-out);
+      text-shadow: 0 1px 0 rgba(0,0,0,.2);
+    }
+    button:active { transform: translateY(1px) scale(1.02, .93); transition-duration: 60ms; box-shadow: inset 0 2px 5px rgba(0,0,0,.3), 0 1px 2px rgba(0,0,0,.2); }
+    .error:not([hidden]) { animation: shake 280ms var(--ease-out); }
+    @keyframes sheetPose { 0% { opacity: 0; transform: translateY(28px) scale(.97); } 55% { opacity: 1; transform: translateY(-6px) scale(1.01); } 80% { transform: translateY(1px); } 100% { opacity: 1; transform: none; } }
+    @keyframes sheetUp { 0% { transform: translateY(100%); } 62% { transform: translateY(-10px); } 82% { transform: translateY(3px); } 100% { transform: none; } }
+    @keyframes heroIn { from { opacity: 0; transform: translate(-14px, -8px); } to { opacity: 1; transform: none; } }
+    @keyframes shake { 0%, 100% { translate: 0; } 20% { translate: -7px; } 40% { translate: 6px; } 60% { translate: -4px; } 80% { translate: 2px; } }
+    @media (max-width: 520px) { .sheet { animation-name: sheetUp; } }
+    @media (pointer: coarse) { input, button { min-height: 52px; } }
+    @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .sheet { background: rgba(255,255,255,.97); } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; } }
   </style>
 </head>
-<body><main class="card"><div class="brand">Tofex · operations</div><h1>Welcome back</h1><p>Sign in to manage your menu, orders, riders, and delivery areas.</p><div id="error" class="error" hidden></div><form method="post" action="/login"><label>Username<input name="username" autocomplete="username" required></label><label>Password<input name="password" type="password" autocomplete="current-password" required></label><button>Sign in</button></form></main><script>const e=new URLSearchParams(location.search).get('error');if(e){const n=document.querySelector('#error');n.hidden=false;n.textContent=e==='not-configured'?'Staff login is not configured yet.':e==='locked'?'Too many failed attempts. Please wait 10 minutes and try again.':'Those credentials are not recognised.';}</script></body>
+<body>
+  <div class="stage">
+    <div class="hero">
+      <div class="logo-mark">T</div>
+      <div>
+        <div class="brand-eyebrow">Tofex Grill &amp; More</div>
+        <div class="brand-title">Kitchen &amp; Dispatch Console</div>
+      </div>
+    </div>
+
+    <main class="sheet">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <h1>Welcome back</h1>
+      <p class="subtitle">Sign in to review receipts, manage your menu, dispatch riders, and track delivery areas.</p>
+      <div id="error" class="error" hidden></div>
+      <form method="post" action="/login">
+        <label>
+          Username
+          <input name="username" autocomplete="username" placeholder="Enter staff username" required>
+        </label>
+        <label>
+          Password
+          <input name="password" type="password" autocomplete="current-password" placeholder="Enter password" required>
+        </label>
+        <button type="submit">Sign in to Console</button>
+      </form>
+    </main>
+  </div>
+
+  <script>
+    // Postel's law: forgive stray spaces in the username (passwords are never altered)
+    document.querySelector('form').addEventListener('submit', ev => { const u = ev.target.elements.username; u.value = u.value.trim(); });
+    const e = new URLSearchParams(location.search).get('error');
+    if (e) {
+      const n = document.querySelector('#error');
+      n.hidden = false;
+      n.textContent =
+        e === 'not-configured' ? 'Staff login is not configured yet.' :
+        e === 'locked' ? 'Too many failed attempts. Please wait 10 minutes and try again.' :
+        'Those credentials are not recognised.';
+    }
+  </script>
+</body>
 </html>
