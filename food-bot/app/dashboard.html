@@ -1707,7 +1707,7 @@
   </div>
 
 <script>
-let data = { items: [], orders: [], riders: [], areas: [], archivedRiders: [] };
+let data = { items: [], orders: [], riders: [], areas: [], archivedRiders: [], takeovers: [] };
 let searchQuery = '';
 let orderFilter = 'all';
 let menuCatFilter = 'all';
@@ -1873,14 +1873,15 @@ function setMenuCatFilter(c) { menuCatFilter = c; render(); }
 
 async function load() {
   try {
-    const [items, orders, riders, areas, archivedRiders] = await Promise.all([
+    const [items, orders, riders, areas, archivedRiders, takeovers] = await Promise.all([
       request('/api/staff/menu'),
       request('/api/staff/orders'),
       request('/api/staff/riders'),
       request('/api/staff/delivery-areas'),
-      request('/api/staff/riders/archived')
+      request('/api/staff/riders/archived'),
+      request('/api/staff/takeovers').catch(() => [])
     ]);
-    data = { items, orders, riders, areas, archivedRiders };
+    data = { items, orders, riders, areas, archivedRiders, takeovers };
     render();
     updateSoundBtn();
     checkAlerts();
@@ -2030,6 +2031,7 @@ function orderCard(o) {
       ${actions(o)}
 
       <div class="actions">
+        ${o.bot_paused ? `<button class="secondary btn-sm" onclick="resumeCustomerBot(${o.customer_id})">🤖 Resume bot</button>` : ''}
         ${o.receipt_media_id ? `<button class="secondary btn-sm" onclick="viewReceipt(${o.id})">🧾 View receipt</button>` : ''}
         ${o.status !== 'paid' ? `<button class="ghost-danger btn-sm" onclick="deleteOrder(${o.id})">Delete</button>` : ''}
       </div>
@@ -2140,6 +2142,45 @@ function riderCard(r) {
         <button class="danger btn-sm" onclick="deleteRider(${r.id})">Delete</button>
       </div>
     </article>`;
+}
+
+function takeoverLeft(until) {
+  if (!until) return 'Paused';
+  const diffMin = Math.max(1, Math.round((new Date(until) - Date.now()) / 60000));
+  return diffMin >= 60 ? `${Math.floor(diffMin / 60)}h ${diffMin % 60}m left` : `${diffMin}m left`;
+}
+
+function takeoverSectionHtml(limit = 4) {
+  const list = (data.takeovers || []).slice(0, limit);
+  if (!list.length) return '';
+  return `
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>Staff chats &amp; help requests</h2>
+          <p>Bot is paused up to 2 hours while your team replies on WhatsApp.</p>
+        </div>
+        <span class="badge orange">${data.takeovers.length} active</span>
+      </div>
+      <div class="grid">
+        ${list.map(t => `
+          <article class="card ${t.escalation_requested_at ? 'urgent' : ''}">
+            <div class="card-top">
+              <div class="card-thumb ${t.escalation_requested_at ? 'crimson' : 'orange'}">💬</div>
+              <div class="card-title-group">
+                <div class="card-title-row">
+                  <span class="card-title">${esc(t.name)}</span>
+                  <span class="badge ${t.escalation_requested_at ? 'crimson' : 'orange'}">${t.escalation_requested_at ? 'Requested staff' : 'Staff handling'}</span>
+                </div>
+                <div class="card-sub"><a href="tel:${esc(t.phone_number)}">${esc(t.phone_number)}</a> · ${takeoverLeft(t.bot_paused_until)}</div>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="primary btn-sm" onclick="resumeCustomerBot(${t.user_id})">🤖 Resume bot</button>
+            </div>
+          </article>`).join('')}
+      </div>
+    </section>`;
 }
 
 function areaCard(a) {
@@ -2281,6 +2322,8 @@ function render() {
         </a>
       </section>
 
+      ${takeoverSectionHtml(4)}
+
       <section class="section">
         <div class="section-head">
           <div>
@@ -2359,6 +2402,7 @@ function render() {
     ];
 
     document.querySelector('#app').innerHTML = `
+      ${takeoverSectionHtml(8)}
       <div class="chips-row">
         ${chips.map(([k, lbl, c]) => `<button type="button" class="chip ${orderFilter === k ? 'active' : ''}" onclick="setOrderFilter('${k}')">${lbl}<span class="chip-count">${c}</span></button>`).join('')}
       </div>
@@ -2673,6 +2717,16 @@ function failModal(id) {
   };
 }
 
+async function resumeCustomerBot(userId) {
+  try {
+    await request(`/api/staff/customers/${userId}/resume-bot`, { method: 'POST' });
+    notice('Automated bot resumed for customer.');
+    load();
+  } catch (e) {
+    notice(e.message, true);
+  }
+}
+
 async function ackFailed(id) { try { await request(`/api/staff/orders/${id}/ack-failed`, { method: 'POST' }); load(); } catch (e) { notice(e.message, true); } }
 async function ackNotReceived(id) { try { await request(`/api/staff/orders/${id}/not-received`, { method: 'POST' }); load(); } catch (e) { notice(e.message, true); } }
 async function review(id, a) {
@@ -2789,6 +2843,9 @@ function alertKeys() {
     if (f.stage === 'failed' && !f.failed_acknowledged) keys.push('failed:' + o.id);
     if (f.not_received_at && !f.not_received_acknowledged) keys.push('missing:' + o.id);
     if (f.dispatch_error) keys.push('dispatch:' + o.id);
+  });
+  (data.takeovers || []).forEach(t => {
+    if (t.escalation_requested_at) keys.push('escalate:' + t.user_id);
   });
   return keys;
 }

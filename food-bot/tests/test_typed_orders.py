@@ -339,3 +339,25 @@ async def test_typed_order_unmatched_text_tip(db, user):
     assert whatsapp.send_text.called
     assert "couldn't match any menu items" in whatsapp.send_text.call_args[0][1]
     assert whatsapp.send_list.called
+
+
+@pytest.mark.asyncio
+async def test_parser_item_first_trailing_naira_and_unpunctuated_clauses(db):
+    """Verify space-separated '<item> <qty>' and trailing Naira amounts like 'plantain 800' parse cleanly."""
+    await seed.main()
+    catalog = await menu_service.get_all_items(db)
+
+    draft = order_parser.parse_typed_order("jollof 2 fried 2 turkey 1 plantain 800", catalog)
+    assert len(draft.followups) == 0
+    assert len(draft.unmatched) == 0
+
+    by_name = {m.name: m for m in draft.matched}
+    assert by_name["Jollof rice"].quantity == 2
+    assert by_name["Fried rice"].quantity == 2
+    assert by_name["Turkey (1)"].quantity == 1
+    assert by_name["Plantain (1)"].quantity == 4  # ₦800 / ₦200 = 4 portions
+
+    qty_first = order_parser.parse_typed_order("2 jollof rice 1 coke", catalog)
+    by_name_qf = {m.name: m for m in qty_first.matched}
+    assert by_name_qf["Jollof rice"].quantity == 2
+    assert by_name_qf["Coke"].quantity == 1

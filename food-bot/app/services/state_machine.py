@@ -39,6 +39,22 @@ logger = logging.getLogger(__name__)
 GREETINGS = {"menu", "hi", "hello", "hey", "start"}
 BACK_COMMANDS = {"back", "go back", "⬅ go back"}
 CANCEL_COMMANDS = {"cancel", "cancel order", "❌ cancel order"}
+TALK_TO_STAFF_COMMANDS = {
+    "talk to staff",
+    "speak to staff",
+    "speak with staff",
+    "talk to human",
+    "speak to human",
+    "talk to agent",
+    "human",
+    "agent",
+    "staff",
+    "support",
+    "customer care",
+    "customer service",
+}
+CUSTOMER_RESUME_COMMANDS = {"resume bot", "use bot", "start bot"}
+STAFF_RESUME_COMMANDS = {"!resume", "/resume", "#resume"}
 MENU_PAGE_SIZE = 6
 CATEGORY_PAGE_SIZE = 9
 AREA_PAGE_SIZE = 5
@@ -206,9 +222,121 @@ async def get_rider_by_phone(session: AsyncSession, phone: str) -> Rider | None:
     return result.scalar_one_or_none()
 
 
+def _utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def is_bot_paused(user: User, now: datetime | None = None) -> bool:
+    """Return True when the bot is currently paused for staff takeover."""
+    until = _utc(getattr(user, "bot_paused_until", None))
+    if until is None:
+        return False
+    ref = _utc(now) or datetime.now(timezone.utc)
+    return until > ref
+
+
+async def pause_bot_for_staff(
+    session: AsyncSession,
+    user: User,
+    *,
+    minutes: int | None = None,
+    escalated: bool = False,
+    now: datetime | None = None,
+) -> datetime:
+    """Pause automated bot replies and checkout timers for `user` (defaults to 2 hours)."""
+    ref = _utc(now) or datetime.now(timezone.utc)
+    pause_mins = max(1, minutes if minutes is not None else settings.staff_takeover_minutes)
+    if getattr(user, "bot_paused_at", None) is None or not is_bot_paused(user, ref):
+        user.bot_paused_at = ref
+    user.bot_paused_until = ref + timedelta(minutes=pause_mins)
+    if escalated:
+        user.escalation_requested_at = ref
+    else:
+        user.escalation_requested_at = None
+    await session.flush()
+    return user.bot_paused_until
+
+
+async def _shift_open_fulfillment_timers(session: AsyncSession, user_id: int, paused_delta: timedelta) -> None:
+    """Shift open checkout/address-edit timers forward so paused time does not count toward cancellation."""
+    if paused_delta <= timedelta(0):
+        return
+    rows = (
+        await session.execute(
+            select(Fulfillment)
+            .join(PaymentBatch, Fulfillment.payment_batch_id == PaymentBatch.id)
+            .where(
+                PaymentBatch.user_id == user_id,
+                PaymentBatch.status == OrderStatus.PENDING,
+                Fulfillment.stage.in_(
+                    (
+                        FulfillmentStage.COLLECTING_DETAILS,
+                        FulfillmentStage.AWAITING_FEE_ACCEPT,
+                        FulfillmentStage.AWAITING_PAYMENT,
+                        FulfillmentStage.AWAITING_APPROVAL,
+                    )
+                ),
+            )
+        )
+    ).scalars().all()
+    for fulfillment in rows:
+        if fulfillment.timer_started_at is not None:
+            fulfillment.timer_started_at = _utc(fulfillment.timer_started_at) + paused_delta
+        if fulfillment.address_editing and fulfillment.address_edit_started_at is not None:
+            fulfillment.address_edit_started_at = _utc(fulfillment.address_edit_started_at) + paused_delta
+
+
+async def resume_bot(session: AsyncSession, user: User, *, now: datetime | None = None) -> bool:
+    """Clear staff takeover pause on `user` and restore shifted checkout timer headroom."""
+    ref = _utc(now) or datetime.now(timezone.utc)
+    paused_at = _utc(getattr(user, "bot_paused_at", None))
+    paused_until = _utc(getattr(user, "bot_paused_until", None))
+    was_active = paused_at is not None or paused_until is not None or getattr(user, "escalation_requested_at", None) is not None
+    if paused_at is not None:
+        effective_end = min(ref, paused_until) if paused_until is not None else ref
+        if effective_end > paused_at:
+            await _shift_open_fulfillment_timers(session, user.id, effective_end - paused_at)
+    user.bot_paused_at = None
+    user.bot_paused_until = None
+    user.escalation_requested_at = None
+    await session.flush()
+    return was_active
+
+
+async def handle_talk_to_staff(session: AsyncSession, user: User) -> None:
+    """Escalate the conversation to human staff and pause the bot for 2 hours."""
+    await pause_bot_for_staff(session, user, escalated=True)
+    mins = max(1, settings.staff_takeover_minutes)
+    duration_label = f"{mins // 60} hours" if mins >= 120 and mins % 60 == 0 else (
+        "1 hour" if mins == 60 else f"{mins} minutes"
+    )
+    await whatsapp.send_text(
+        user.phone_number,
+        (
+            f"🙋 I've paused the automated bot and alerted our team. A staff member will reply to you right here shortly "
+            f"(or call {settings.support_phone} if urgent).\n\n"
+            f"_(The bot will stay quiet for {duration_label} so you can chat freely. "
+            f"Reply *resume bot* anytime if you'd like to return to the automated menu.)_"
+        ),
+    )
+
+
 async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
-    """Route one WhatsApp message: riders first, then an open checkout, then normal browsing."""
+    """Route one WhatsApp message: riders first, staff takeover, then open checkout, then browsing."""
     rider = await get_rider_by_phone(session, msg.sender)
+    if msg.from_me:
+        if rider is not None:
+            return
+        user = await get_or_create_user(session, msg.sender)
+        staff_cmd = (msg.text or "").strip().lower()
+        if staff_cmd in STAFF_RESUME_COMMANDS:
+            await resume_bot(session, user)
+        else:
+            await pause_bot_for_staff(session, user, escalated=False)
+        return
+
     if rider is not None:
         rider.last_message_at = datetime.now(timezone.utc)
         await handle_rider_message(session, rider, msg)
@@ -218,6 +346,21 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     raw_text = (msg.text or "").strip()
     text = raw_text.lower()
     rid = msg.reply_id or ""
+    now = datetime.now(timezone.utc)
+
+    if getattr(user, "bot_paused_until", None) is not None:
+        if is_bot_paused(user, now):
+            if rid == "staff:resume" or text in CUSTOMER_RESUME_COMMANDS:
+                await resume_bot(session, user, now=now)
+                await whatsapp.send_text(
+                    user.phone_number,
+                    "🤖 Automated bot resumed! Send *menu* to browse or continue your order.",
+                )
+            return
+        await resume_bot(session, user, now=now)
+
+    if rid == "staff:escalate" or text in TALK_TO_STAFF_COMMANDS:
+        return await handle_talk_to_staff(session, user)
 
     # An open checkout owns the conversation. We route by the ORDER, not by user.current_state,
     # so browsing the menu can never make the bot ignore a receipt photo or an address answer.
@@ -401,12 +544,15 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
                 user.phone_number,
                 (
                     "💡 I couldn't match any menu items in that message.\n"
-                    "Try typing like: *2 jollof rice, 1 chicken medium, 1 coke* — or pick from the menu below:"
+                    "Try typing like: *2 jollof rice, 1 chicken medium, 1 coke* — pick from the menu below, or reply *staff* to chat with us:"
                 ),
             )
             return await handle_menu_request(session, user, 0)
 
-    await whatsapp.send_text(user.phone_number, "Hi! Send *menu* to see what's available right now.")
+    await whatsapp.send_text(
+        user.phone_number,
+        "Hi! Send *menu* to see what's available right now, or reply *staff* to chat with our team.",
+    )
 
 
 async def handle_go_back_browsing(session: AsyncSession, user: User) -> None:
@@ -792,6 +938,12 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
         rows.append({"id": f"menupg:{page - 1}", "title": "⬅ Previous categories"})
     if total_qty > 0:
         rows.append({"id": "cancel", "title": "❌ Cancel order"})
+    if page == 0:
+        rows.append({
+            "id": "staff:escalate",
+            "title": "💬 Talk to staff",
+            "description": "Pause bot & chat with our team",
+        })
 
     if total_qty > 0:
         body = (
@@ -1085,6 +1237,7 @@ async def _send_typed_order_confirmation(
 
     buttons.append(("typeorder:retype", "✏️ Retype my order"))
     buttons.append(("menu", "🍛 Pick from menu instead"))
+    buttons.append(("staff:escalate", "💬 Talk to staff"))
     buttons.append(("nav:back", "⬅ Go back"))
     buttons.append(("cancel", "❌ Cancel order"))
 

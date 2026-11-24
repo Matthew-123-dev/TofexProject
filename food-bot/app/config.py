@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     rider_pickup_reminder_minutes: int = 10
     rider_window_warning_hours: int = 23
     overdue_grace_minutes: int = 10
+    staff_takeover_minutes: int = 120
 
     # Print outgoing messages instead of sending them, and expose /dev/outbox for the simulator.
     dry_run: bool = False

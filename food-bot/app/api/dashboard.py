@@ -25,6 +25,7 @@ from app.models import (
     ReceiptImage,
     Rider,
     SessionState,
+    User,
 )
 from app.services import menu_service, order_service, state_machine, whatsapp
 from app.utils import naira, normalize_phone
@@ -587,6 +588,58 @@ async def update_delivery_area(area_id: int, payload: DeliveryAreaInput) -> dict
         return _area(area)
 
 
+@router.get("/api/staff/takeovers")
+async def list_takeovers() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(User).where(User.bot_paused_until.is_not(None), User.bot_paused_until > now)
+        )
+        users = list(result.scalars())
+        users.sort(
+            key=lambda u: (
+                0 if u.escalation_requested_at else 1,
+                -(u.escalation_requested_at.timestamp() if u.escalation_requested_at else 0.0),
+                u.bot_paused_until.timestamp() if u.bot_paused_until else 0.0,
+            )
+        )
+        return [_takeover_user(u) for u in users]
+
+
+@router.post("/api/staff/customers/{user_id}/pause-bot")
+async def pause_customer_bot(user_id: int) -> dict:
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        await state_machine.pause_bot_for_staff(session, user, escalated=False)
+        await session.commit()
+        await session.refresh(user)
+        return _takeover_user(user)
+
+
+@router.post("/api/staff/customers/{user_id}/resume-bot")
+async def resume_customer_bot(user_id: int) -> dict:
+    async with async_session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        await state_machine.resume_bot(session, user)
+        await session.commit()
+        return {"status": "resumed", "user_id": user_id}
+
+
+def _takeover_user(user: User) -> dict:
+    return {
+        "user_id": user.id,
+        "name": user.name or user.phone_number,
+        "phone_number": user.phone_number,
+        "bot_paused": state_machine.is_bot_paused(user),
+        "bot_paused_until": user.bot_paused_until.isoformat() if user.bot_paused_until else None,
+        "escalation_requested_at": user.escalation_requested_at.isoformat() if user.escalation_requested_at else None,
+    }
+
+
 def _menu_item(item: MenuItem) -> dict:
     return {
         "id": item.id,
@@ -602,6 +655,7 @@ def _menu_item(item: MenuItem) -> dict:
 
 def _batch(batch) -> dict:
     fulfillment = batch.fulfillment
+    customer_user = batch.orders[0].user
     return {
         "id": batch.id,
         "status": batch.status.value,
@@ -609,9 +663,14 @@ def _batch(batch) -> dict:
         "delivery_fee": str(batch.delivery_fee),
         "receipt_media_id": batch.receipt_media_id,
         "created_at": batch.created_at.isoformat() if batch.created_at else None,
-        "customer": batch.orders[0].user.name or batch.orders[0].user.phone_number,
-        "phone_number": batch.orders[0].user.phone_number,
-        "customer_id": batch.orders[0].user.id,
+        "customer": customer_user.name or customer_user.phone_number,
+        "phone_number": customer_user.phone_number,
+        "customer_id": customer_user.id,
+        "bot_paused": state_machine.is_bot_paused(customer_user),
+        "bot_paused_until": customer_user.bot_paused_until.isoformat() if customer_user.bot_paused_until else None,
+        "escalation_requested_at": (
+            customer_user.escalation_requested_at.isoformat() if customer_user.escalation_requested_at else None
+        ),
         "fulfillment": {
             "type": fulfillment.fulfillment_type,
             "stage": fulfillment.stage.value,

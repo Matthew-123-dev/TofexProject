@@ -58,6 +58,9 @@ class User(Base):
     current_state: Mapped[SessionState] = mapped_column(
         Enum(SessionState, native_enum=False, length=32), default=SessionState.BROWSING
     )
+    bot_paused_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    bot_paused_until: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    escalation_requested_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), server_default=func.now())
     saved_address: Mapped["SavedAddress | None"] = relationship(back_populates="user", uselist=False)
 

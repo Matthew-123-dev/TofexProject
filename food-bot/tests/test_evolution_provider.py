@@ -27,11 +27,13 @@ def reset_evolution_caches():
     whatsapp.LAST_MENU_MAP.clear()
     whatsapp._LAST_MENU_KIND.clear()
     whatsapp.SEEN_MESSAGE_IDS.clear()
+    whatsapp.BOT_SENT_IDS.clear()
     whatsapp._MEDIA_CACHE.clear()
     yield
     whatsapp.LAST_MENU_MAP.clear()
     whatsapp._LAST_MENU_KIND.clear()
     whatsapp.SEEN_MESSAGE_IDS.clear()
+    whatsapp.BOT_SENT_IDS.clear()
     whatsapp._MEDIA_CACHE.clear()
 
 
@@ -319,7 +321,19 @@ async def test_inbound_evolution_filtering_dedup_and_resolution(client, db, user
         kind="list",
     )
 
-    # 1. Ignore fromMe == True
+    # 1a. Ignore fromMe == True echoes of the bot's own sent messages
+    whatsapp.BOT_SENT_IDS.add_or_seen("evo-bot-echo-1")
+    bot_echo_payload = {
+        "event": "messages.upsert",
+        "instance": "tofex-main",
+        "data": {
+            "key": {"remoteJid": jid, "fromMe": True, "id": "evo-bot-echo-1"},
+            "message": {"conversation": "1"},
+        },
+    }
+    assert whatsapp.parse_incoming(bot_echo_payload) == []
+
+    # 1b. Manual staff replies (fromMe == True, not in BOT_SENT_IDS) emit a from_me takeover signal
     from_me_payload = {
         "event": "messages.upsert",
         "instance": "tofex-main",
@@ -328,7 +342,10 @@ async def test_inbound_evolution_filtering_dedup_and_resolution(client, db, user
             "message": {"conversation": "1"},
         },
     }
-    assert whatsapp.parse_incoming(from_me_payload) == []
+    staff_msgs = whatsapp.parse_incoming(from_me_payload)
+    assert len(staff_msgs) == 1
+    assert staff_msgs[0].from_me is True
+    assert staff_msgs[0].reply_id is None
 
     # 2. Ignore non-@s.whatsapp.net JIDs (groups, broadcast)
     group_payload = {

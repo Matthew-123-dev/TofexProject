@@ -85,6 +85,7 @@ ITEM_ALIASES: dict[str, str] = {
     "jolof rice": "Jollof rice",
     "jellof rice": "Jollof rice",
     "party jollof": "Jollof rice",
+    "fried": "Fried rice",
     "fried rice": "Fried rice",
     "friedrice": "Fried rice",
     "spag": "Spaghetti",
@@ -450,6 +451,77 @@ class ParsedOrderDraft:
         return "; ".join(parts)
 
 
+_MODIFIER_STARTERS = {
+    "add", "extra", "more", "less", "little", "no", "without", "remove", "minus", "not",
+    "plenty", "well", "very", "lots", "please", "pls", "abeg",
+}
+_QUANTITY_CONNECTORS = {"of", "worth", "for", "x", "naira", "ngn", "alive", "liter", "litre", "liters", "litres"}
+
+
+def _is_bare_int(tok: str) -> bool:
+    clean = tok.lstrip("₦#").replace(",", "")
+    return clean.isdecimal()
+
+
+def _split_space_separated_items(clause: str) -> list[str]:
+    """Split unpunctuated multi-item lines like 'jollof 2 fried 2 turkey 1 plantain 800'."""
+    tokens = clause.split()
+    if len(tokens) < 4:
+        return [clause]
+
+    first_clean = tokens[0].lower()
+    last_clean = tokens[-1].lstrip("₦#").replace(",", "")
+    starts_with_qty = _is_bare_int(tokens[0]) or first_clean in NUMBER_WORDS
+    ends_with_num = _is_bare_int(last_clean)
+    numeric_positions = [i for i, t in enumerate(tokens) if _is_bare_int(t)]
+    if len(numeric_positions) < 2 and not (not starts_with_qty and ends_with_num and len(numeric_positions) == 1 and numeric_positions[0] < len(tokens) - 1):
+        return [clause]
+
+    # Item-first style: "jollof 2 fried 2 turkey 1 plantain 800" -> split AFTER numbers followed by non-modifier words
+    if not starts_with_qty and ends_with_num:
+        out: list[str] = []
+        buf: list[str] = []
+        for idx, tok in enumerate(tokens):
+            buf.append(tok)
+            if idx < len(tokens) - 1 and _is_bare_int(tok):
+                nxt = tokens[idx + 1].lower().strip(",.-")
+                if nxt not in UNIT_WORDS and nxt not in _MODIFIER_STARTERS and nxt not in _QUANTITY_CONNECTORS:
+                    out.append(" ".join(buf))
+                    buf = []
+        if buf:
+            out.append(" ".join(buf))
+        return out if len(out) > 1 else [clause]
+
+    # Qty-first style: "2 jollof rice 1 chicken medium 1 coke" -> split BEFORE subsequent leading numbers
+    if starts_with_qty:
+        out = []
+        buf = [tokens[0]]
+        for idx in range(1, len(tokens)):
+            tok = tokens[idx]
+            prev = tokens[idx - 1].lower().strip(",.-")
+            nxt = tokens[idx + 1].lower().strip(",.-") if idx + 1 < len(tokens) else ""
+            is_trailing_size = idx == len(tokens) - 1 and prev in {"chicken", "turkey", "plantain"} and _is_bare_int(tok) and int(tok.replace(",", "")) <= 5
+            is_alive = tok == "5" and nxt == "alive"
+            if (
+                _is_bare_int(tok)
+                and not is_trailing_size
+                and not is_alive
+                and prev not in _QUANTITY_CONNECTORS
+                and prev != "₦"
+                and nxt
+                and nxt not in _QUANTITY_CONNECTORS
+            ):
+                out.append(" ".join(buf))
+                buf = [tok]
+            else:
+                buf.append(tok)
+        if buf:
+            out.append(" ".join(buf))
+        return out if len(out) > 1 else [clause]
+
+    return [clause]
+
+
 def split_order_clauses(text: str) -> list[str]:
     """Split a free-text order into individual item clauses without breaking modifier phrases."""
     cleaned = POLITE_FILLER_RE.sub("", text.strip())
@@ -474,10 +546,11 @@ def split_order_clauses(text: str) -> list[str]:
     )
     clauses: list[str] = []
     for part in raw_parts:
-        restored = part.replace("__MODJOIN__", " ").replace("__HALF__", "1/2").strip(" ,.-•*")
-        restored = POLITE_FILLER_RE.sub("", restored).strip()
-        if restored:
-            clauses.append(restored)
+        for sub in _split_space_separated_items(part.strip(" ,.-•*")):
+            restored = sub.replace("__MODJOIN__", " ").replace("__HALF__", "1/2").strip(" ,.-•*")
+            restored = POLITE_FILLER_RE.sub("", restored).strip()
+            if restored:
+                clauses.append(restored)
     return clauses
 
 
@@ -516,9 +589,9 @@ def _extract_quantity_and_naira(clause: str) -> tuple[str, int, int | None]:
                 naira_amount = amt
                 working = (working[:of_match.start()] + " " + working[of_match.end():]).strip()
 
-    # 2. Leading Naira prefix (e.g. "₦800 jollof rice" or "#800 jollof")
+    # 2. Leading Naira prefix or bare leading amount >= 100 (e.g. "₦800 jollof rice" or "800 plantain")
     if naira_amount is None:
-        lead_naira = re.match(r"^(?:₦|#)\s*(\d[\d,]*)\s+(.+)$", working)
+        lead_naira = re.match(r"^(?:₦|#)?\s*(\d[\d,]*)\s+(.+)$", working)
         if lead_naira:
             amt_str = lead_naira.group(1).replace(",", "")
             if amt_str.isdecimal() and int(amt_str) >= 100:
@@ -526,15 +599,18 @@ def _extract_quantity_and_naira(clause: str) -> tuple[str, int, int | None]:
                 working = lead_naira.group(2).strip()
 
     # 3. Multiplier syntax: "2x jollof" or "jollof x2" or "jollof x 3"
+    has_explicit_qty = False
     mult_lead = re.match(r"^(\d+)\s*x\b\s*(.+)$", working, re.IGNORECASE)
     if mult_lead:
         quantity = max(1, int(mult_lead.group(1)))
         working = mult_lead.group(2).strip()
+        has_explicit_qty = True
     else:
         mult_trail = re.search(r"\bx\s*(\d+)$", working, re.IGNORECASE)
         if mult_trail:
             quantity = max(1, int(mult_trail.group(1)))
             working = working[:mult_trail.start()].strip()
+            has_explicit_qty = True
         else:
             # 4. Leading digit or number word (unless "1/2 liter" or "5 alive")
             if not re.match(r"^(?:1/2|5\s*alive)\b", working, re.IGNORECASE):
@@ -546,9 +622,25 @@ def _extract_quantity_and_naira(clause: str) -> tuple[str, int, int | None]:
                         if token.isdecimal() and int(token) < 100:
                             quantity = max(1, int(token))
                             working = rest
+                            has_explicit_qty = True
                         elif token in NUMBER_WORDS:
                             quantity = NUMBER_WORDS[token]
                             working = rest
+                            has_explicit_qty = True
+
+    # 4b. Trailing bare Naira amount >= 100 ("plantain 800", "shawarma 1200") or trailing quantity ("jollof 2")
+    trail_num = re.match(r"^(.+?)\s+(?:₦|#)?(\d[\d,]*)$", working)
+    if trail_num:
+        prefix = trail_num.group(1).strip()
+        raw_val = trail_num.group(2).replace(",", "")
+        if raw_val.isdecimal() and "(" not in working:
+            val = int(raw_val)
+            if val >= 100 and naira_amount is None:
+                naira_amount = val
+                working = prefix
+            elif 1 <= val < 100 and not has_explicit_qty and _normalize_phrase(working) not in ITEM_ALIASES:
+                quantity = val
+                working = prefix
 
     # 5. Strip leading unit words ("2 plates of jollof rice" -> "jollof rice")
     tokens = working.split()

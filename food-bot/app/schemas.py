@@ -15,3 +15,4 @@ class IncomingMessage:
     longitude: float | None = None
     location_name: str | None = None
     location_address: str | None = None
+    from_me: bool = False

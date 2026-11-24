@@ -12,7 +12,7 @@ from app.messages import M13_REMINDER, M14_CANCELLED, M18_DELIVERED, R4_PICKUP_R
 from app.models import (
     Fulfillment, FulfillmentStage, Order, OrderStatus, PaymentBatch, ProcessedMessage, Rider, SessionState, User,
 )
-from app.services import whatsapp
+from app.services import state_machine, whatsapp
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +80,13 @@ async def _process_checkout_timers(now: datetime) -> None:
                 if batch is None or batch.status != OrderStatus.PENDING:
                     continue
                 user = await session.get(User, batch.user_id)
+                if user is not None and getattr(user, "bot_paused_until", None) is not None:
+                    if state_machine.is_bot_paused(user, now):
+                        continue
+                    await state_machine.resume_bot(session, user, now=now)
+                    await session.commit()
+                    if fulfillment.timer_started_at is None:
+                        continue
                 elapsed = now - fulfillment.timer_started_at
                 what = WHAT_WE_WAIT_FOR[fulfillment.stage]
 
@@ -123,11 +130,22 @@ async def _process_address_edit_timeouts(now: datetime) -> None:
                 fulfillment = await session.get(Fulfillment, fid)
                 if fulfillment is None or not fulfillment.address_editing:
                     continue
+                batch = await session.get(PaymentBatch, fulfillment.payment_batch_id)
+                user = await session.get(User, batch.user_id) if batch else None
+                if user is not None and getattr(user, "bot_paused_until", None) is not None:
+                    if state_machine.is_bot_paused(user, now):
+                        continue
+                    await state_machine.resume_bot(session, user, now=now)
+                    await session.commit()
+                    if (
+                        not fulfillment.address_editing
+                        or fulfillment.address_edit_started_at is None
+                        or fulfillment.address_edit_started_at > cutoff
+                    ):
+                        continue
                 fulfillment.address_editing = False
                 fulfillment.address_edit_started_at = None
                 fulfillment.checkout_step = None
-                batch = await session.get(PaymentBatch, fulfillment.payment_batch_id)
-                user = await session.get(User, batch.user_id) if batch else None
                 if user is not None:
                     if fulfillment.stage == FulfillmentStage.AWAITING_APPROVAL:
                         user.current_state = SessionState.AWAITING_APPROVAL

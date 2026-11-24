@@ -125,6 +125,7 @@ class BoundedTTLCache:
 LAST_MENU_MAP: _PhoneMenuCache = _PhoneMenuCache()
 _LAST_MENU_KIND: dict[str, str] = {}
 SEEN_MESSAGE_IDS = BoundedTTLCache(maxsize=4096, ttl=3600.0)
+BOT_SENT_IDS = BoundedTTLCache(maxsize=4096, ttl=3600.0)
 _MEDIA_CACHE: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
 
 
@@ -283,6 +284,23 @@ async def _send(payload: dict) -> bool:
     return True
 
 
+def _extract_evolution_message_id(data: Any) -> str | None:
+    """Extract the WhatsApp message ID returned by Evolution API send endpoints."""
+    if not isinstance(data, dict):
+        return None
+    for container in (data, data.get("data")):
+        if not isinstance(container, dict):
+            continue
+        key = container.get("key")
+        if isinstance(key, dict) and key.get("id"):
+            return str(key["id"]).strip()
+        for field in ("messageId", "id"):
+            val = container.get(field)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
 async def _send_evolution(endpoint: str, body: dict) -> bool:
     base_url = settings.evolution_api_url.rstrip("/")
     instance = settings.evolution_instance.strip("/")
@@ -296,6 +314,12 @@ async def _send_evolution(endpoint: str, body: dict) -> bool:
     if r.status_code >= 400:
         logger.error("Evolution API send failed (%s): %s %s", endpoint, r.status_code, r.text)
         return False
+    try:
+        sent_id = _extract_evolution_message_id(r.json())
+        if sent_id:
+            BOT_SENT_IDS.add_or_seen(sent_id)
+    except ValueError:
+        pass
     return True
 
 
@@ -651,8 +675,6 @@ def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
     for item in items:
         key = item.get("key") if isinstance(item.get("key"), dict) else {}
         from_me = key.get("fromMe") if "fromMe" in key else item.get("fromMe", False)
-        if from_me is True:
-            continue
 
         remote_jid = _resolve_whatsapp_jid(
             key.get("remoteJid"),
@@ -662,6 +684,46 @@ def _parse_evolution_incoming(payload: dict) -> list[IncomingMessage]:
             item.get("senderPn"),
         )
         key_id = str(key.get("id") or item.get("keyId") or "").strip()
+
+        if from_me is True:
+            if raw_event != "messages.upsert" or not remote_jid or not key_id:
+                continue
+            if key_id in BOT_SENT_IDS:
+                continue
+            dedup_id = f"fromme:{key_id}"[:200]
+            if SEEN_MESSAGE_IDS.add_or_seen(dedup_id):
+                continue
+            msg_obj = item.get("message") if isinstance(item.get("message"), dict) else {}
+            staff_text: str | None = None
+            if isinstance(msg_obj.get("conversation"), str):
+                staff_text = msg_obj["conversation"]
+            elif isinstance(msg_obj.get("extendedTextMessage"), dict) and isinstance(
+                msg_obj["extendedTextMessage"].get("text"), str
+            ):
+                staff_text = msg_obj["extendedTextMessage"]["text"]
+            elif isinstance(item.get("text"), str):
+                staff_text = item["text"]
+            else:
+                for media_key in ("imageMessage", "videoMessage", "documentMessage"):
+                    media_obj = msg_obj.get(media_key)
+                    if isinstance(media_obj, dict):
+                        staff_text = media_obj.get("caption") if isinstance(media_obj.get("caption"), str) else ""
+                        break
+            has_human_media = any(
+                k in msg_obj for k in ("imageMessage", "videoMessage", "audioMessage", "pttMessage", "documentMessage")
+            ) or item.get("messageType") in {"imageMessage", "videoMessage", "audioMessage", "documentMessage"}
+            if staff_text is None and not has_human_media:
+                continue
+            out.append(
+                IncomingMessage(
+                    id=dedup_id,
+                    sender=_clean_phone(remote_jid),
+                    type="text",
+                    text=staff_text,
+                    from_me=True,
+                )
+            )
+            continue
 
         if raw_event == "messages.update":
             poll_selections = _extract_poll_selections(item)
