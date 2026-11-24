@@ -10,7 +10,6 @@ from app.utils import naira
 
 # Items moved from 'Food' to 'Protein 1' (Beef, Fish, Plantain & Extras) even on already-seeded DBs
 EXTRAS_MOVED_FROM_FOOD: set[str] = {"Plantain (1)", "Moimoi"}
-STEP1_PRIMARY_CATEGORIES: list[str] = ["Food", "Snacks", "Drinks"]
 
 # Customer-facing category labels (Principle 3: Recognition over recall)
 CATEGORY_DISPLAY_NAMES: dict[str, str] = {

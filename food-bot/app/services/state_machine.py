@@ -100,7 +100,13 @@ def _clear_user_ephemeral_state(phone: str, *, clear_typed: bool = True) -> None
 def _journey_update(phone: str, **kwargs) -> dict:
     st = _JOURNEY_STATE.setdefault(
         phone,
-        {"mode": "browse", "has_saved": False, "preselected_area": False, "fulfillment": None},
+        {
+            "mode": "browse",
+            "has_saved": False,
+            "preselected_area": False,
+            "fulfillment": None,
+            "browsed_categories": False,
+        },
     )
     st.update(kwargs)
     return st
@@ -113,26 +119,30 @@ def _step_counts(phone: str, stage: str) -> tuple[int, int]:
     has_saved = bool(st.get("has_saved", False))
     pre_area = bool(st.get("preselected_area", False))
     fulfill = st.get("fulfillment")
+    browsed_cats = bool(st.get("browsed_categories", False))
+    cat_offset = 1 if (mode == "browse" and browsed_cats) else 0
 
     if stage == "welcome":
         return 1, (3 if has_saved else 5)
+    if stage == "categories":
+        return 2, (5 if has_saved else 7)
     if stage in {"category", "quantity"}:
-        return 2, (4 if has_saved else 6)
+        return 2 + cat_offset, (4 + cat_offset if has_saved else 6 + cat_offset)
     if stage in {"hub", "carts", "typed_prompt", "typed_followup"}:
         if mode == "quick":
             total = 3 if has_saved else (4 if pre_area else 5)
             return 2, total
-        return 3, (4 if has_saved else 6)
+        return 3 + cat_offset, (4 + cat_offset if has_saved else 6 + cat_offset)
     if stage == "choice":
-        base = 2 if mode == "quick" else 3
+        base = 2 if mode == "quick" else (3 + cat_offset)
         return base + 1, base + 3
     if stage in {"area", "other_area"}:
-        base = 2 if mode == "quick" else 3
+        base = 2 if mode == "quick" else (3 + cat_offset)
         return base + 2, base + 4
     if stage == "street":
         if pre_area and not has_saved:
             return 3, 4
-        base = 2 if mode == "quick" else 3
+        base = 2 if mode == "quick" else (3 + cat_offset)
         return base + 3, base + 4
     if stage in {"extras", "pin", "landmark", "phone2", "notes"}:
         _, tot = _step_counts(phone, "summary")
@@ -141,10 +151,10 @@ def _step_counts(phone: str, stage: str) -> tuple[int, int]:
     if mode == "repeat" and has_saved and fulfill == "delivery":
         return 2, 2
     if has_saved and fulfill == "delivery":
-        return (3, 3) if mode == "quick" else (4, 4)
+        return (3, 3) if mode == "quick" else (4 + cat_offset, 4 + cat_offset)
     if pre_area and fulfill == "delivery":
         return 4, 4
-    base = 2 if mode == "quick" else 3
+    base = 2 if mode == "quick" else (3 + cat_offset)
     if fulfill == "pickup":
         return base + 2, base + 2
     return base + 4, base + 4
@@ -546,10 +556,14 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         )
         return
 
-    if text in GREETINGS or rid in {"menu", "nav:categories"}:
+    if text in GREETINGS or rid == "menu":
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
-        return await handle_menu_request(session, user)
+        return await handle_menu_request(session, user, 0)
+    if rid == "nav:categories":
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        _clear_typed_draft(user.phone_number)
+        return await handle_menu_request(session, user, 1)
     if rid in {"typeorder:start", "typeorder:retype"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         return await prompt_typed_order(user)
@@ -1057,25 +1071,21 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
     last_order = await order_service.get_last_order(session, user.id) if total_qty == 0 else None
     saved, saved_area = await _active_saved_address(session, user.id)
     has_saved = saved is not None and saved_area is not None
-    _journey_update(
-        user.phone_number,
-        mode="browse",
-        has_saved=has_saved,
-        preselected_area=user.phone_number in _PRESELECTED_AREA,
-        fulfillment=None,
-    )
 
-    page0_cats = [c for c in menu_service.STEP1_PRIMARY_CATEGORIES if c in categories]
-    if not page0_cats:
-        page0_cats = categories[:3]
-    more_cats = [c for c in categories if c not in page0_cats]
-
-    if page > 0 and more_cats:
+    if page > 0:
+        _journey_update(
+            user.phone_number,
+            mode="browse",
+            has_saved=has_saved,
+            preselected_area=user.phone_number in _PRESELECTED_AREA,
+            fulfillment=None,
+            browsed_categories=True,
+        )
         per_page = _effective_menu_page_size()
-        extra_pages = max(1, (len(more_cats) + per_page - 1) // per_page)
-        extra_page = min(page - 1, extra_pages - 1)
-        start = extra_page * per_page
-        slice_cats = more_cats[start:start + per_page]
+        cat_pages = max(1, (len(categories) + per_page - 1) // per_page)
+        cat_page = min(page - 1, cat_pages - 1)
+        start = cat_page * per_page
+        slice_cats = categories[start : start + per_page]
         rows: list[dict] = [
             {
                 "id": f"cat:{c}",
@@ -1084,20 +1094,28 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
             }
             for c in slice_cats
         ]
-        if start + per_page < len(more_cats):
-            rows.append({"id": f"menupg:{extra_page + 2}", "title": "More categories"})
-        if extra_page > 0:
-            rows.append({"id": f"menupg:{extra_page}", "title": "⬅ Previous categories"})
-        else:
-            rows.append({"id": "menu", "title": "⬅ Main menu"})
+        if start + per_page < len(categories):
+            rows.append({"id": f"menupg:{cat_page + 2}", "title": "More categories"})
+        if cat_page > 0:
+            rows.append({"id": f"menupg:{cat_page}", "title": "⬅ Previous categories"})
         rows.append({"id": "nav:back", "title": "⬅ Go back"})
         cart_line = await _cart_status_line(session, user.id)
+        page_suffix = f" ({cat_page + 1}/{cat_pages})" if cat_pages > 1 else ""
         body = _format_poll_header(
-            f"{_step_label(user.phone_number, 'welcome')} · More Categories ({extra_page + 1}/{extra_pages})",
+            f"{_step_label(user.phone_number, 'categories')} · 📂 Categories{page_suffix}",
             cart_line if total_qty > 0 else "Pick a category below:",
         )
-        await whatsapp.send_list(user.phone_number, body, "More options", "Categories", rows)
+        await whatsapp.send_list(user.phone_number, body, "Choose category", "Categories", rows)
         return
+
+    _journey_update(
+        user.phone_number,
+        mode="browse",
+        has_saved=has_saved,
+        preselected_area=user.phone_number in _PRESELECTED_AREA,
+        fulfillment=None,
+        browsed_categories=False,
+    )
 
     catalog = await menu_service.get_all_items(session)
     heroes = menu_service.resolve_hero_options(catalog)
@@ -1128,22 +1146,15 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
             "description": hero["description"],
         })
 
-    for c in page0_cats:
-        rows.append({
-            "id": f"cat:{c}",
-            "title": menu_service.friendly_category_name(c),
-            "aliases": [c],
-        })
-
-    if more_cats:
-        more_preview = ", ".join(menu_service.friendly_category_name(c).split(" ", 1)[-1] for c in more_cats[:3])
-        if len(more_cats) > 3:
-            more_preview += "…"
-        rows.append({
-            "id": "menupg:1",
-            "title": "📂 More Categories",
-            "description": more_preview[:72],
-        })
+    cat_preview = ", ".join(menu_service.friendly_category_name(c).split(" ", 1)[-1] for c in categories[:3])
+    if len(categories) > 3:
+        cat_preview += "…"
+    rows.append({
+        "id": "menupg:1",
+        "title": "📂 Categories",
+        "description": cat_preview[:72],
+        "aliases": ["categories", "browse categories", "menu categories"],
+    })
 
     rows.append({
         "id": "staff:escalate",
@@ -1155,13 +1166,13 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
     if total_qty > 0:
         cart_total = subtotal + pack_fee
         title_line = f"{step_lbl} · 🛒 Cart {naira(cart_total)}"
-        ctx = "Tap a combo, pick a category, or type your order:"
+        ctx = "Tap a combo, browse categories, or type your order:"
     elif last_order is not None:
         title_line = f"{step_lbl} · 👋 Welcome back to {settings.brand_name}!"
-        ctx = "Tap Repeat, pick a combo/category, or type your order:"
+        ctx = "Tap Repeat, a combo, Categories, or type your order:"
     else:
         title_line = f"{step_lbl} · 👋 {settings.brand_name}"
-        ctx = "Tap a combo, pick a category, or just type your order (e.g. 2 jollof, 1 coke):"
+        ctx = "Tap a combo, browse Categories, or type your order (e.g. 2 jollof, 1 coke):"
 
     body = _format_poll_header(title_line, ctx)
     await whatsapp.send_list(user.phone_number, body, "View menu", "Quick Menu", rows)

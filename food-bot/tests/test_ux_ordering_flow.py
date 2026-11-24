@@ -19,10 +19,10 @@ def clear_ux_state():
 
 @pytest.mark.asyncio
 async def test_ux_step1_friendly_categories_and_single_poll_pagination(db, user):
-    """Verify actionable Step 1 welcome poll (<=9 slots), More Categories pagination, and single-poll category browsing."""
+    """Verify 5-option Step 1 welcome poll, full Categories screen, and single-poll category browsing."""
     await seed.main()
 
-    # Step 1: Actionable Welcome Poll (3 Hero Slots + 3 Primary Categories + More Categories + Talk to staff = 8 slots)
+    # Step 1: First-time Welcome Poll (Combo 1 + Combo 2 + Shawarma + Categories + Talk to staff = 5 slots)
     await state_machine.handle_incoming(
         db, IncomingMessage(id="ux-1", sender=user.phone_number, type="text", text="hi")
     )
@@ -33,27 +33,33 @@ async def test_ux_step1_friendly_categories_and_single_poll_pagination(db, user)
 
     assert "Step 1 of 5" in step1_body
     assert len(step1_body) <= 255
-    assert 2 <= len(step1_rows) <= 9
+    assert len(step1_rows) == 5
     row_ids = [r["id"] for r in step1_rows]
-    assert "bundle:jollof_fried_chicken" in row_ids
-    assert "bundle:spag_turkey" in row_ids
-    assert any(r_id.startswith("add:") for r_id in row_ids)  # Shawarma Large
-    assert "cat:Food" in row_ids
-    assert "cat:Snacks" in row_ids
-    assert "cat:Drinks" in row_ids
-    assert "menupg:1" in row_ids
-    assert "staff:escalate" in row_ids
+    assert row_ids[0] == "bundle:jollof_fried_chicken"
+    assert row_ids[1] == "bundle:spag_turkey"
+    assert row_ids[2].startswith("add:")  # Shawarma Large
+    assert row_ids[3] == "menupg:1"
+    assert "Categories" in step1_rows[3]["title"]
+    assert row_ids[4] == "staff:escalate"
 
-    # Page 2 of Categories shows Protein 2, Protein 3, Protein 1, Icecream
+    # Categories screen via "📂 Categories" shows all 7 categories + Go back
     whatsapp.send_list.reset_mock()
     await state_machine.handle_incoming(
         db, IncomingMessage(id="ux-pg2", sender=user.phone_number, type="interactive", reply_id="menupg:1")
     )
+    cats_body = whatsapp.send_list.call_args[0][1]
     pg2_ids = [r["id"] for r in whatsapp.send_list.call_args[0][4]]
-    assert "cat:Protein 2" in pg2_ids
-    assert "cat:Protein 3" in pg2_ids
-    assert "cat:Protein 1" in pg2_ids
-    assert "cat:Icecream" in pg2_ids
+    assert "Step 2 of 7" in cats_body
+    assert [
+        "cat:Food",
+        "cat:Snacks",
+        "cat:Protein 2",
+        "cat:Protein 3",
+        "cat:Protein 1",
+        "cat:Drinks",
+        "cat:Icecream",
+        "nav:back",
+    ] == pg2_ids
 
     # Verify Food contains only the 4 main meals (no Plantain/Moimoi)
     whatsapp.send_list.reset_mock()
@@ -75,7 +81,7 @@ async def test_ux_step1_friendly_categories_and_single_poll_pagination(db, user)
     assert "Moimoi" in prot1_titles
     assert "Beef" in prot1_titles
 
-    # Step 2: Multi-page category (Drinks has 19 items) shows 9 items per page + single poll per turn
+    # Step 3 of 7: Multi-page category (Drinks has 19 items) shows 9 items per page + single poll per turn
     whatsapp.send_list.reset_mock()
     whatsapp.send_buttons.reset_mock()
     await state_machine.handle_incoming(
@@ -85,7 +91,7 @@ async def test_ux_step1_friendly_categories_and_single_poll_pagination(db, user)
     assert whatsapp.send_buttons.call_count == 0
     drinks_body = whatsapp.send_list.call_args[0][1]
     drinks_rows = whatsapp.send_list.call_args[0][4]
-    assert "Step 2 of 6" in drinks_body
+    assert "Step 3 of 7" in drinks_body
     assert len(drinks_body) <= 255
     assert 2 <= len(drinks_rows) <= 12
     assert drinks_rows[0]["title"] == "Coke"

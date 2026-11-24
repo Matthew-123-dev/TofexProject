@@ -165,22 +165,33 @@ async def test_evolution_poll_constraints_and_step1_reduced_slots(db, monkeypatc
     assert poll_calls
     step1_poll = poll_calls[-1]["json"]
     _assert_evolution_poll(step1_poll)
-    assert len(step1_poll["values"]) < 12  # 3 heroes + 3 primary cats + More + Staff = 8
+    assert len(step1_poll["values"]) == 5  # 3 heroes + Categories + Talk to staff
     menu_ids = set(whatsapp.LAST_MENU_MAP[phone].values())
-    assert "bundle:jollof_fried_chicken" in menu_ids
-    assert "bundle:spag_turkey" in menu_ids
-    assert f"add:{items['Shawama (2000)'].id}" in menu_ids
-    assert {"cat:Food", "cat:Snacks", "cat:Drinks", "menupg:1", "staff:escalate"} <= menu_ids
-    assert "cat:Protein 2" not in menu_ids
-    assert "cat:Icecream" not in menu_ids
+    assert [whatsapp.LAST_MENU_MAP[phone][str(i)] for i in range(1, 6)] == [
+        "bundle:jollof_fried_chicken",
+        "bundle:spag_turkey",
+        f"add:{items['Shawama (2000)'].id}",
+        "menupg:1",
+        "staff:escalate",
+    ]
+    assert not any(m.startswith("cat:") for m in menu_ids)
 
-    # Page 2 of categories via "More Categories"
+    # Categories screen via "📂 Categories" shows all 7 categories + Go back
     await state_machine.handle_incoming(db, _msg_reply(phone, "menupg:1", 2))
     await db.commit()
-    more_poll = [c for c in calls if "/message/sendPoll/" in c["url"]][-1]["json"]
-    _assert_evolution_poll(more_poll)
-    more_ids = set(whatsapp.LAST_MENU_MAP[phone].values())
-    assert {"cat:Protein 2", "cat:Protein 3", "cat:Protein 1", "cat:Icecream"} <= more_ids
+    cats_poll = [c for c in calls if "/message/sendPoll/" in c["url"]][-1]["json"]
+    _assert_evolution_poll(cats_poll)
+    cats_ids = set(whatsapp.LAST_MENU_MAP[phone].values())
+    assert {
+        "cat:Food",
+        "cat:Snacks",
+        "cat:Drinks",
+        "cat:Protein 2",
+        "cat:Protein 3",
+        "cat:Protein 1",
+        "cat:Icecream",
+        "nav:back",
+    } <= cats_ids
 
     # Drinks category pagination (9 items/page on Evolution)
     await state_machine.handle_incoming(db, _msg_reply(phone, "cat:Drinks", 3))
@@ -370,7 +381,14 @@ async def test_returning_customer_repeat_order_2_taps_and_switch_pickup(db, monk
     await state_machine.handle_incoming(db, _msg_text(phone_a, "hi", 1))
     await db.commit()
     greeting_rows = [r["id"] for r in sent[-1]["rows"]]
-    assert "repeat:last" in greeting_rows
+    assert greeting_rows == [
+        "repeat:last",
+        "bundle:jollof_fried_chicken",
+        "bundle:spag_turkey",
+        f"add:{items['Shawama (2000)'].id}",
+        "menupg:1",
+        "staff:escalate",
+    ]
 
     # Tap 1: repeat:last -> straight to Checkout Summary (with Step 2 of 2 header)
     await state_machine.handle_incoming(db, _msg_reply(phone_a, "repeat:last", 2))
@@ -636,19 +654,20 @@ async def test_meta_cloud_api_payload_limits(db, monkeypatch):
                     assert len(r["description"]) <= 72
 
     phone = "2348011110012"
-    for msg in [
+    for idx, msg in enumerate([
         _msg_text(phone, "hi", 1),
-        _msg_reply(phone, "cat:Drinks", 2),
-        _msg_reply(phone, f"add:{items['Jollof rice'].id}", 3),
-        _msg_reply(phone, "checkout", 4),
-        _msg_reply(phone, "fulfillment:delivery", 5),
-    ]:
+        _msg_reply(phone, "menupg:1", 2),
+        _msg_reply(phone, "cat:Drinks", 3),
+        _msg_reply(phone, f"add:{items['Jollof rice'].id}", 4),
+        _msg_reply(phone, "checkout", 5),
+        _msg_reply(phone, "fulfillment:delivery", 6),
+    ]):
         await state_machine.handle_incoming(db, msg)
         await db.commit()
         _assert_meta_limits(calls[-1]["json"])
 
     # Verify Drinks category on Meta uses META_MENU_PAGE_SIZE = 7 items max on page 0
-    drinks_payload = calls[1]["json"]["interactive"]
+    drinks_payload = calls[2]["json"]["interactive"]
     drinks_rows = [r for sec in drinks_payload["action"]["sections"] for r in sec["rows"]]
     assert len([r for r in drinks_rows if r["id"].startswith("add:")]) <= 7
 
