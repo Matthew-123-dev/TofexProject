@@ -1,12 +1,13 @@
 """Customer and rider message templates kept in one editable module."""
 
 M1_CHOICE = (
-    "Step 5 of 6: Delivery or Pickup?\n"
+    "{step_label} · 🚚 Delivery or Pickup?\n"
     "{cart_line}\n"
-    "How would you like to receive your order?"
+    "How would you like to receive your order?\n"
+    "(0=cancel, HELP=staff)"
 )
 M2_STREET = (
-    "✍️ *TYPE YOUR STREET ADDRESS & LANDMARK (Step 5 of 6)*\n"
+    "✍️ *TYPE YOUR STREET ADDRESS & LANDMARK ({step_label})*\n"
     "Great, delivery it is! 🛵\n\n"
     "Please type your *house/plot number, street name, and nearest landmark* in one message (8–220 characters).\n"
     "👉 Example: *14 Denro-Ishashi Road, opposite St. Leo Catholic Church*\n\n"
@@ -14,36 +15,38 @@ M2_STREET = (
     "_(Or reply *BACK* to change your area, or *CANCEL* to cancel)_"
 )
 M3_AREA = (
-    "Step 5 of 6: Select your delivery area\n"
+    "{step_label} · 📍 Select Delivery Area\n"
     "{cart_line}\n"
-    "Pick your area to see the delivery fee & est. time:"
+    "Pick your area (or 0=cancel, HELP=staff):"
 )
 M3B_OTHER_AREA = (
-    "✍️ *TYPE YOUR AREA NAME BELOW (Step 5 of 6)*\n"
+    "✍️ *TYPE YOUR AREA NAME BELOW ({step_label})*\n"
     "No problem! Which area or neighborhood are you ordering from?\n"
     "👉 Example: *Ojodu Berger* or *Agbado Crossing*\n\n"
     "_(Or reply *BACK* to see our standard areas, or *CANCEL* to cancel)_"
 )
 M4_PIN = (
-    "Step 5 of 6: Location pin (Optional)\n"
-    "📍 To help our rider find you faster, you can share your WhatsApp location pin now, or skip this step."
+    "{step_label} · 📍 Location Pin (Optional)\n"
+    "To help our rider find you faster, you can share your WhatsApp location pin now, or skip this step."
 )
 M5_LANDMARK = (
-    "✍️ *TYPE NEAREST LANDMARK BELOW (Step 5 of 6)*\n"
+    "✍️ *TYPE NEAREST LANDMARK BELOW ({step_label})*\n"
     "What is a popular landmark near your address?\n"
     "👉 Example: *Opposite St. Leo Catholic Church* or *Near Ajuwon Bus Stop*\n\n"
     "_(Or reply *BACK* to go back, or *CANCEL* to cancel)_"
 )
 M6_SECOND_PHONE = (
-    "Step 5 of 6: Backup phone number (Optional)\n"
-    "📞 If you have a second phone number for the rider, type it now, or tap an option below:"
+    "{step_label} · 📞 Backup Phone (Optional)\n"
+    "If you have a second phone number for the rider, type it now, or tap an option below:\n"
+    "(0=cancel, HELP=staff)"
 )
 M7_NOTES = (
-    "Step 5 of 6: Delivery notes (Optional)\n"
-    '📝 Any special instructions for the rider (e.g. "Call at the estate gate")? Type them now, or tap below:'
+    "{step_label} · 📝 Delivery Notes (Optional)\n"
+    'Any special instructions for the rider (e.g. "Call at the estate gate")? Type them now, or tap below:\n'
+    "(0=cancel, HELP=staff)"
 )
 M8_SUMMARY = (
-    "🧾 *ORDER SUMMARY (Step 6 of 6)*\n\n"
+    "🧾 *ORDER SUMMARY ({step_label})*\n\n"
     "*Items:*\n{items_block}\n\n"
     "*Delivery Details:*\n"
     "📍 {street}, {area}\n"
@@ -51,33 +54,35 @@ M8_SUMMARY = (
     "{second_phone_line}{notes_line}\n"
     "*Cost Breakdown:*\n"
     "• Items subtotal: {subtotal}\n"
+    "{packaging_line}"
     "• Delivery fee: {fee}\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💰 *TOTAL TO PAY: {total}*"
 )
 M8_PICKUP_SUMMARY = (
-    "🧾 *ORDER SUMMARY (Step 6 of 6)*\n\n"
+    "🧾 *ORDER SUMMARY ({step_label})*\n\n"
     "*Items:*\n{items_block}\n\n"
     "*Pickup Location:*\n"
     "🏪 {outlet_address}\n\n"
     "*Cost Breakdown:*\n"
     "• Items subtotal: {subtotal}\n"
+    "{packaging_line}"
     "• Pickup fee: ₦0\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💰 *TOTAL TO PAY: {total}*"
 )
 M8_CONFIRM_POLL = (
-    "Step 6 of 6: Confirm your order\n"
-    "💰 Total to pay: {total}\n"
-    "Everything look right? Tap an option below:"
+    "{step_label} · 💳 Confirm & Pay {total}\n"
+    "Everything look right? Tap an option below:\n"
+    "(0=cancel, HELP=staff)"
 )
 M8B_OTHER_AREA = (
-    "⏳ *Checking Delivery Fee (Step 6 of 6)*\n"
+    "⏳ *Checking Delivery Fee*\n"
     "Thank you! Your area isn't on our standard list, so our team is confirming your delivery fee right now. "
     "We'll message you shortly."
 )
 M8C_QUOTE = (
-    "Step 6 of 6: Delivery fee quote ready\n"
+    "🚚 Delivery fee quote ready\n"
     "📍 Area: {area} · Delivery fee: {fee}\n"
     "💰 Total to pay: {total}\n"
     "Would you like to proceed?"

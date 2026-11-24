@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import logging
 import re
-from typing import Sequence
+from typing import Any, Sequence
 
 try:
     from rapidfuzz import fuzz, process as rf_process
@@ -419,6 +419,24 @@ class SoldOutNotice:
     alternatives: list[tuple[int, str, Decimal]] = field(default_factory=list)
 
 
+AREA_ALIASES: dict[str, str] = {
+    "lambe": "Lambe Junction",
+    "ojodu berger": "Berger",
+    "ojodu": "Berger",
+    "ishasi": "Ishashi",
+    "ishashi road": "Ishashi",
+    "ishashi rd": "Ishashi",
+    "denro ishashi": "Denro",
+    "denro-ishashi": "Denro",
+    "akute junction": "Akute",
+}
+
+_TRAILING_AREA_RE = re.compile(
+    r"(?:[,\s]+)(?:deliver(?:y)?\s+to|send\s+to|to|at|in)\s+([a-zA-Z0-9\s/-]{2,40})\s*$",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class ParsedOrderDraft:
     matched: list[MatchedOrderItem] = field(default_factory=list)
@@ -427,6 +445,8 @@ class ParsedOrderDraft:
     unmatched: list[str] = field(default_factory=list)
     sold_out: list[SoldOutNotice] = field(default_factory=list)
     general_notes: list[str] = field(default_factory=list)
+    matched_area_id: int | None = None
+    matched_area_name: str | None = None
     cart_mode: str = "add"  # "add" | "replace"
     awaiting_cart_mode: bool = False
     followup_index: int = 0
@@ -435,6 +455,17 @@ class ParsedOrderDraft:
     @property
     def has_any_recognition(self) -> bool:
         return bool(self.matched or self.followups or self.sold_out or self.please_specify)
+
+    @property
+    def is_high_confidence(self) -> bool:
+        return (
+            bool(self.matched)
+            and not self.followups
+            and not self.unmatched
+            and not self.sold_out
+            and not self.please_specify
+            and not any(m.stock_capped_from is not None for m in self.matched)
+        )
 
     @property
     def subtotal(self) -> Decimal:
@@ -735,11 +766,59 @@ def undo_followup_choice(draft: ParsedOrderDraft, q: FollowUpQuestion) -> None:
     q.resolved_qty = 0
 
 
-def parse_typed_order(text: str, catalog: Sequence[MenuItem]) -> ParsedOrderDraft:
-    """Parse a customer's free-text message against the live `MenuItem` catalog."""
+def _extract_trailing_area(text: str, areas: Sequence[Any]) -> tuple[str, int | None, str | None]:
+    """Detect a trailing delivery zone phrase like 'to Akute' and match against active DeliveryArea rows."""
+    active_areas = [a for a in areas if getattr(a, "is_active", True)]
+    if not active_areas or not text.strip():
+        return text, None, None
+
+    working = TRAILING_FILLER_RE.sub("", text.strip()).strip()
+    m = _TRAILING_AREA_RE.search(working)
+    if not m:
+        return text, None, None
+
+    candidate_norm = _normalize_phrase(m.group(1))
+    if not candidate_norm:
+        return text, None, None
+
+    area_lookup: dict[str, Any] = {}
+    by_norm_name = {_normalize_phrase(a.name): a for a in active_areas}
+    for norm_name, area in by_norm_name.items():
+        area_lookup[norm_name] = area
+    for alias, target_name in AREA_ALIASES.items():
+        target = by_norm_name.get(_normalize_phrase(target_name))
+        if target is not None:
+            area_lookup[_normalize_phrase(alias)] = target
+
+    matched_area = area_lookup.get(candidate_norm)
+    if matched_area is None and len(candidate_norm) >= 4:
+        best_score = 0.0
+        for key, area in area_lookup.items():
+            score = float(fuzz.token_sort_ratio(candidate_norm, key))
+            if score > best_score:
+                best_score = score
+                matched_area = area
+        if best_score < 88.0:
+            matched_area = None
+
+    if matched_area is None:
+        return text, None, None
+
+    remaining = working[: m.start()].strip(" ,.-")
+    return remaining, matched_area.id, matched_area.name
+
+
+def parse_typed_order(
+    text: str, catalog: Sequence[MenuItem], areas: Sequence[Any] | None = None
+) -> ParsedOrderDraft:
+    """Parse a customer's free-text message against the live `MenuItem` catalog (and optional `DeliveryArea` list)."""
     draft = ParsedOrderDraft()
     if not text or not text.strip():
         return draft
+
+    working_text = text
+    if areas:
+        working_text, draft.matched_area_id, draft.matched_area_name = _extract_trailing_area(working_text, areas)
 
     by_name: dict[str, MenuItem] = {item.name: item for item in catalog}
     by_lower: dict[str, MenuItem] = {item.name.lower(): item for item in catalog}
@@ -756,7 +835,7 @@ def parse_typed_order(text: str, catalog: Sequence[MenuItem]) -> ParsedOrderDraf
 
     candidate_keys = list(candidate_to_canonical.keys())
 
-    clauses = split_order_clauses(text)
+    clauses = split_order_clauses(working_text)
     size_followups: list[FollowUpQuestion] = []
     fuzzy_followups: list[FollowUpQuestion] = []
 

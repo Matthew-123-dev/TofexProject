@@ -119,6 +119,7 @@ class PaymentBatch(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     delivery_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    packaging_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0"), server_default="0")
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     receipt_media_id: Mapped[str | None] = mapped_column(String(120))
     status: Mapped[OrderStatus] = mapped_column(
@@ -155,6 +156,7 @@ class Order(Base):
     payment_batch_id: Mapped[int] = mapped_column(ForeignKey("payment_batches.id"), index=True)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     delivery_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    packaging_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0"), server_default="0")
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, native_enum=False, length=16, values_callable=lambda e: [m.value for m in e]),

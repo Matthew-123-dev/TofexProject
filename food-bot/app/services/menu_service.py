@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -5,9 +6,11 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import MenuItem, Order
+from app.utils import naira
 
 # Items moved from 'Food' to 'Protein 1' (Beef, Fish, Plantain & Extras) even on already-seeded DBs
 EXTRAS_MOVED_FROM_FOOD: set[str] = {"Plantain (1)", "Moimoi"}
+STEP1_PRIMARY_CATEGORIES: list[str] = ["Food", "Snacks", "Drinks"]
 
 # Customer-facing category labels (Principle 3: Recognition over recall)
 CATEGORY_DISPLAY_NAMES: dict[str, str] = {
@@ -159,6 +162,125 @@ async def get_item(session: AsyncSession, item_id: int) -> MenuItem | None:
 async def find_items(session: AsyncSession, name: str) -> list[MenuItem]:
     result = await session.execute(select(MenuItem).where(MenuItem.name.ilike(f"%{name}%")).order_by(MenuItem.name))
     return list(result.scalars())
+
+
+def default_tap_quantity(item: MenuItem) -> int:
+    """Optimistic default quantity inserted on a 1-tap item selection (Plantain defaults to 2)."""
+    if item.name == "Plantain (1)":
+        limit = item.sellable_units
+        return 1 if limit is not None and limit < 2 else 2
+    return 1
+
+
+def _is_sellable(item: MenuItem | None, needed_qty: int = 1) -> bool:
+    return bool(
+        item is not None
+        and item.is_available
+        and (item.sellable_units is None or item.sellable_units >= needed_qty)
+    )
+
+
+def _pick_protein_with_fallback(
+    catalog: Sequence[MenuItem], preferred_name: str, category_name: str
+) -> MenuItem | None:
+    """Return `preferred_name` if sellable, otherwise the cheapest available item in `category_name`."""
+    by_name = {m.name: m for m in catalog}
+    preferred = by_name.get(preferred_name)
+    if _is_sellable(preferred, 1):
+        return preferred
+    candidates = [m for m in catalog if m.category == category_name and _is_sellable(m, 1)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda m: (m.price, m.name.lower()))
+    return candidates[0]
+
+
+def resolve_hero_options(catalog: Sequence[MenuItem]) -> list[dict]:
+    """Build Step 1 hero combos & bestsellers from the live catalog with cheapest-first protein fallback."""
+    by_name = {m.name: m for m in catalog}
+    heroes: list[dict] = []
+
+    jollof = by_name.get("Jollof rice")
+    fried = by_name.get("Fried rice")
+    chicken = _pick_protein_with_fallback(catalog, "Chicken (2)", "Protein 2")
+    if _is_sellable(jollof, 2) and _is_sellable(fried, 1) and chicken is not None:
+        assert jollof is not None and fried is not None
+        total = jollof.price * 2 + fried.price + chicken.price
+        heroes.append({
+            "id": "bundle:jollof_fried_chicken",
+            "title": "🔥 Jollof, Fried & Chicken",
+            "description": f"{naira(total)} · 2 Jollof, 1 Fried, {friendly_item_name(chicken.name)}",
+            "items": [(jollof, 2), (fried, 1), (chicken, 1)],
+            "total_price": total,
+        })
+
+    spag = by_name.get("Spaghetti")
+    turkey = _pick_protein_with_fallback(catalog, "Turkey (2)", "Protein 3")
+    if _is_sellable(spag, 2) and turkey is not None:
+        assert spag is not None
+        total = spag.price * 2 + turkey.price
+        heroes.append({
+            "id": "bundle:spag_turkey",
+            "title": "🔥 Spaghetti & Turkey",
+            "description": f"{naira(total)} · 2 Spag, {friendly_item_name(turkey.name)}",
+            "items": [(spag, 2), (turkey, 1)],
+            "total_price": total,
+        })
+
+    shawarma = by_name.get("Shawama (2000)")
+    if _is_sellable(shawarma, 1):
+        assert shawarma is not None
+        heroes.append({
+            "id": f"add:{shawarma.id}",
+            "title": "🌯 Shawarma (Large)",
+            "description": naira(shawarma.price),
+            "items": [(shawarma, 1)],
+            "total_price": shawarma.price,
+        })
+
+    return heroes
+
+
+_ADDON_BUCKETS: dict[str, list[str]] = {
+    "combo": ["Coke", "Can malt", "Plantain (1)", "Big cup", "Fanta", "Bottle water", "Moimoi"],
+    "protein": ["Jollof rice", "Fried rice", "Plantain (1)", "Coke", "Spaghetti", "Beef", "Fanta", "Bottle water"],
+    "food": ["Chicken (1)", "Beef", "Plantain (1)", "Coke", "Turkey (1)", "Moimoi", "Fanta", "Bottle water"],
+    "snacks": ["Coke", "Can malt", "Popcorn (200)", "Big cup", "Fanta", "Bottle water", "Small cup", "Meatpie"],
+    "drinks": ["Shawama (1200)", "Meatpie", "Jollof rice", "Popcorn (200)", "Eggroll", "Fried rice", "Shawama (2000)", "Chicken (1)"],
+}
+
+
+def get_contextual_addons(
+    catalog: Sequence[MenuItem],
+    last_item: MenuItem | None,
+    cart_item_ids: set[int],
+    limit: int = 4,
+) -> list[tuple[MenuItem, int]]:
+    """Return up to `limit` direct 1-tap `(item, default_qty)` cross-sells tailored to `last_item`."""
+    if last_item is None:
+        bucket = "combo"
+    elif last_item.name in EXTRAS_MOVED_FROM_FOOD or last_item.category in {"Protein 1", "Protein 2", "Protein 3"}:
+        bucket = "protein"
+    elif last_item.category == "Food":
+        bucket = "food"
+    elif last_item.category == "Snacks":
+        bucket = "snacks"
+    else:
+        bucket = "drinks"
+
+    by_name = {m.name: m for m in catalog}
+    picked: list[tuple[MenuItem, int]] = []
+    for name in _ADDON_BUCKETS[bucket]:
+        item = by_name.get(name)
+        if item is None or item.id in cart_item_ids:
+            continue
+        qty = default_tap_quantity(item)
+        if not _is_sellable(item, qty):
+            continue
+        picked.append((item, qty))
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def _touch(item: MenuItem) -> None:

@@ -34,7 +34,7 @@ from app.models import (
     SessionState,
     User,
 )
-from app.services import order_service, whatsapp
+from app.services import order_service, state_machine, whatsapp
 
 DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -46,9 +46,23 @@ test_engine = create_async_engine(
 TestingSessionFactory = async_sessionmaker(test_engine, expire_on_commit=False)
 
 
+def _clear_state_machine_ephemeral() -> None:
+    state_machine._NAV_STACK.clear()
+    state_machine._CUSTOM_QTY_ITEM.clear()
+    state_machine._TYPED_ORDER_DRAFTS.clear()
+    state_machine._TYPED_ORDER_PROMPTED.clear()
+    state_machine._KITCHEN_NOTES.clear()
+    state_machine._JOURNEY_STATE.clear()
+    state_machine._PRESELECTED_AREA.clear()
+    state_machine._PREV_CART_SNAPSHOT.clear()
+    state_machine._LAST_TYPED_ITEMS.clear()
+    state_machine._USED_SAVED_SUMMARY.clear()
+
+
 @pytest.fixture(autouse=True)
 def fake_whatsapp(monkeypatch):
     """Mock outgoing WhatsApp API calls and set test staff credentials safely in memory."""
+    _clear_state_machine_ephemeral()
     monkeypatch.setattr(whatsapp, "send_text", AsyncMock(return_value=True))
     monkeypatch.setattr(whatsapp, "send_buttons", AsyncMock(return_value=True))
     monkeypatch.setattr(whatsapp, "send_list", AsyncMock(return_value=True))
@@ -56,6 +70,7 @@ def fake_whatsapp(monkeypatch):
     monkeypatch.setattr(settings, "staff_username", "admin")
     monkeypatch.setattr(settings, "staff_password", "test-staff-password-123")
     yield
+    _clear_state_machine_ephemeral()
 
 
 @pytest_asyncio.fixture

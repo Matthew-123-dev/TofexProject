@@ -49,13 +49,15 @@ TALK_TO_STAFF_COMMANDS = {
     "human",
     "agent",
     "staff",
+    "help",
     "support",
     "customer care",
     "customer service",
 }
 CUSTOMER_RESUME_COMMANDS = {"resume bot", "use bot", "start bot"}
 STAFF_RESUME_COMMANDS = {"!resume", "/resume", "#resume"}
-MENU_PAGE_SIZE = 6
+MENU_PAGE_SIZE = 9
+META_MENU_PAGE_SIZE = 7
 CATEGORY_PAGE_SIZE = 9
 AREA_PAGE_SIZE = 5
 QUANTITY_PAGE_SIZE = 10
@@ -65,10 +67,121 @@ TYPED_ORDER_TTL_SECONDS = 1800.0
 
 # Per-user navigation history, custom-quantity prompt state, and typed-order state (in-memory, keyed by phone)
 _NAV_STACK: dict[str, list[dict]] = {}
-_CUSTOM_QTY_ITEM: dict[str, int] = {}
+_CUSTOM_QTY_ITEM: dict[str, tuple[int, str] | int] = {}
 _TYPED_ORDER_DRAFTS: dict[str, tuple[float, order_parser.ParsedOrderDraft]] = {}
 _TYPED_ORDER_PROMPTED: set[str] = set()
 _KITCHEN_NOTES: dict[str, str] = {}
+_JOURNEY_STATE: dict[str, dict] = {}
+_PRESELECTED_AREA: dict[str, tuple[int, str]] = {}
+_PREV_CART_SNAPSHOT: dict[str, list[tuple[int, int]]] = {}
+_LAST_TYPED_ITEMS: dict[str, list[tuple[int, int, str | None]]] = {}
+_USED_SAVED_SUMMARY: set[str] = set()
+
+
+def _effective_menu_page_size() -> int:
+    if not whatsapp.is_evolution_provider() and not settings.dry_run:
+        return META_MENU_PAGE_SIZE
+    return MENU_PAGE_SIZE
+
+
+def _clear_user_ephemeral_state(phone: str, *, clear_typed: bool = True) -> None:
+    _CUSTOM_QTY_ITEM.pop(phone, None)
+    _NAV_STACK.pop(phone, None)
+    _KITCHEN_NOTES.pop(phone, None)
+    _JOURNEY_STATE.pop(phone, None)
+    _PRESELECTED_AREA.pop(phone, None)
+    _PREV_CART_SNAPSHOT.pop(phone, None)
+    _LAST_TYPED_ITEMS.pop(phone, None)
+    _USED_SAVED_SUMMARY.discard(phone)
+    if clear_typed:
+        _clear_typed_draft(phone)
+
+
+def _journey_update(phone: str, **kwargs) -> dict:
+    st = _JOURNEY_STATE.setdefault(
+        phone,
+        {"mode": "browse", "has_saved": False, "preselected_area": False, "fulfillment": None},
+    )
+    st.update(kwargs)
+    return st
+
+
+def _step_counts(phone: str, stage: str) -> tuple[int, int]:
+    """Compute `(current_step, total_steps)` dynamically for the user's active path."""
+    st = _JOURNEY_STATE.get(phone, {})
+    mode = st.get("mode", "browse")
+    has_saved = bool(st.get("has_saved", False))
+    pre_area = bool(st.get("preselected_area", False))
+    fulfill = st.get("fulfillment")
+
+    if stage == "welcome":
+        return 1, (3 if has_saved else 5)
+    if stage in {"category", "quantity"}:
+        return 2, (4 if has_saved else 6)
+    if stage in {"hub", "carts", "typed_prompt", "typed_followup"}:
+        if mode == "quick":
+            total = 3 if has_saved else (4 if pre_area else 5)
+            return 2, total
+        return 3, (4 if has_saved else 6)
+    if stage == "choice":
+        base = 2 if mode == "quick" else 3
+        return base + 1, base + 3
+    if stage in {"area", "other_area"}:
+        base = 2 if mode == "quick" else 3
+        return base + 2, base + 4
+    if stage == "street":
+        if pre_area and not has_saved:
+            return 3, 4
+        base = 2 if mode == "quick" else 3
+        return base + 3, base + 4
+    if stage in {"extras", "pin", "landmark", "phone2", "notes"}:
+        _, tot = _step_counts(phone, "summary")
+        return max(1, tot - 1), tot
+    # stage == "summary"
+    if mode == "repeat" and has_saved and fulfill == "delivery":
+        return 2, 2
+    if has_saved and fulfill == "delivery":
+        return (3, 3) if mode == "quick" else (4, 4)
+    if pre_area and fulfill == "delivery":
+        return 4, 4
+    base = 2 if mode == "quick" else 3
+    if fulfill == "pickup":
+        return base + 2, base + 2
+    return base + 4, base + 4
+
+
+def _step_label(phone: str, stage: str) -> str:
+    cur, tot = _step_counts(phone, stage)
+    return f"Step {cur} of {tot}"
+
+
+def _format_poll_header(title_line: str, context_line: str = "", *, include_hint: bool = True) -> str:
+    parts = [title_line.strip()]
+    if context_line.strip():
+        parts.append(context_line.strip())
+    if include_hint:
+        parts.append("(0=cancel, HELP=staff)")
+    text = "\n".join(parts)
+    if len(text) <= 255:
+        return text
+    if include_hint and context_line.strip():
+        short_ctx = context_line.strip()[: max(20, 255 - len(parts[0]) - len("(0=cancel, HELP=staff)") - 4)]
+        text = f"{parts[0]}\n{short_ctx}\n(0=cancel, HELP=staff)"
+    return text[:255]
+
+
+def _pack_summary_line(pack_fee: Decimal) -> str:
+    if pack_fee <= 0:
+        return ""
+    size = "Big" if pack_fee >= order_service.PACKAGING_BIG_FEE else "Small"
+    return f"• Takeaway pack ({size}): {naira(pack_fee)}\n"
+
+
+def _short_item_name(name: str, max_len: int = 18) -> str:
+    friendly = menu_service.friendly_item_name(name)
+    if len(friendly) <= max_len:
+        return friendly
+    return friendly[: max_len - 1].rstrip() + "…"
 
 
 def _get_typed_draft(phone: str) -> order_parser.ParsedOrderDraft | None:
@@ -180,10 +293,13 @@ async def _cart_status_line(session: AsyncSession | None, user_id: int) -> str:
     """Build a concise 1-line cart status summary for poll headers (Principle 2)."""
     if session is None:
         return "🛒 Cart: Empty"
-    total_qty, subtotal = await order_service.get_user_cart_summary(session, user_id)
+    total_qty, subtotal, pack_fee = await order_service.get_user_cart_totals(session, user_id)
     if total_qty <= 0:
         return "🛒 Cart: Empty"
-    return f"🛒 Cart: {total_qty} item{'s' if total_qty != 1 else ''} ({naira(subtotal)})"
+    total = subtotal + pack_fee
+    if pack_fee > 0:
+        return f"🛒 Cart: {total_qty} item{'s' if total_qty != 1 else ''} · {naira(total)} (incl. {naira(pack_fee)} pack)"
+    return f"🛒 Cart: {total_qty} item{'s' if total_qty != 1 else ''} ({naira(total)})"
 
 
 def _batch_items_block(batch: PaymentBatch) -> str:
@@ -372,7 +488,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         or text in CANCEL_COMMANDS
         or text in BACK_COMMANDS
         or text == "address"
-        or rid in {"cancel", "nav:back", "checkout:edit_items"}
+        or rid in {"cancel", "nav:back", "checkout:edit_items", "cart:view"}
     ):
         return await handle_checkout_flow(session, user, open_fulfillment, msg)
 
@@ -400,10 +516,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     # Escape routes during browsing: Cancel or Go Back
     if rid == "cancel" or text in CANCEL_COMMANDS:
-        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
-        _NAV_STACK.pop(user.phone_number, None)
-        _clear_typed_draft(user.phone_number)
-        _KITCHEN_NOTES.pop(user.phone_number, None)
+        _clear_user_ephemeral_state(user.phone_number)
         if session is not None:
             await order_service.clear_user_carts(session, user.id)
         user.current_state = SessionState.BROWSING
@@ -418,11 +531,14 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     # Custom 5+ quantity free-text input when active
     if user.phone_number in _CUSTOM_QTY_ITEM and not rid and text not in GREETINGS:
-        item_id = _CUSTOM_QTY_ITEM[user.phone_number]
+        entry = _CUSTOM_QTY_ITEM[user.phone_number]
+        item_id, qty_mode = entry if isinstance(entry, tuple) else (entry, "add")
         if raw_text.isdecimal():
             qty_val = int(raw_text)
             if 1 <= qty_val <= MAX_CUSTOM_QUANTITY:
                 _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+                if qty_mode == "set":
+                    return await handle_set_item_quantity(session, user, item_id, qty_val)
                 return await handle_add_item(session, user, item_id, qty_val)
         await whatsapp.send_text(
             user.phone_number,
@@ -430,7 +546,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         )
         return
 
-    if text in GREETINGS or rid == "menu":
+    if text in GREETINGS or rid in {"menu", "nav:categories"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
         return await handle_menu_request(session, user)
@@ -447,6 +563,8 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         return await handle_typed_order_alt(session, user, rid.removeprefix("typeorder:alt:"))
     if rid == "typeorder:confirm":
         return await handle_typed_order_confirm(session, user)
+    if rid == "typeorder:replace_prev":
+        return await handle_typed_order_replace_prev(session, user)
     if rid == "repeat:last" or text in {"repeat", "repeat last order", "repeat order"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
@@ -474,19 +592,55 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
         return await handle_category_selected(session, user, rid.removeprefix("cat:"))
+    if rid.startswith("bundle:"):
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        return await handle_bundle_add(session, user, rid)
     if rid.startswith("add:"):
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         item_id_text = rid.removeprefix("add:")
         if not item_id_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
             return
-        return await show_quantity_selection(session, user, int(item_id_text))
+        return await handle_optimistic_add(session, user, int(item_id_text))
+    if rid.startswith("quick_add:"):
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        item_id_text = rid.removeprefix("quick_add:")
+        if not item_id_text.isdecimal():
+            await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
+            return
+        return await handle_optimistic_add(session, user, int(item_id_text))
+    if rid.startswith("qty_inc:"):
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        inc_parts = rid.removeprefix("qty_inc:").split(":")
+        if len(inc_parts) != 2 or not all(part.isdecimal() for part in inc_parts):
+            await whatsapp.send_text(user.phone_number, "That quantity is invalid. Send *menu* to start again.")
+            return
+        return await handle_add_item(session, user, int(inc_parts[0]), int(inc_parts[1]))
+    if rid.startswith("qty_menu:"):
+        item_id_text = rid.removeprefix("qty_menu:")
+        if not item_id_text.isdecimal():
+            await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
+            return
+        return await show_quantity_selection(session, user, int(item_id_text), mode="set")
+    if rid.startswith("qtyset:"):
+        _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
+        qty_parts = rid.removeprefix("qtyset:").split(":")
+        if len(qty_parts) != 2 or not all(part.isdecimal() for part in qty_parts):
+            await whatsapp.send_text(user.phone_number, "That quantity is invalid. Send *menu* to start again.")
+            return
+        return await handle_set_item_quantity(session, user, int(qty_parts[0]), int(qty_parts[1]))
+    if rid.startswith("qtycustomset:"):
+        item_id_text = rid.removeprefix("qtycustomset:")
+        if not item_id_text.isdecimal():
+            await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
+            return
+        return await prompt_custom_quantity(session, user, int(item_id_text), mode="set")
     if rid.startswith("qtycustom:"):
         item_id_text = rid.removeprefix("qtycustom:")
         if not item_id_text.isdecimal():
             await whatsapp.send_text(user.phone_number, "That menu item is invalid. Send *menu* to start again.")
             return
-        return await prompt_custom_quantity(session, user, int(item_id_text))
+        return await prompt_custom_quantity(session, user, int(item_id_text), mode="add")
     if rid.startswith("qty:"):
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         quantity_parts = rid.removeprefix("qty:").split(":")
@@ -494,7 +648,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
             await whatsapp.send_text(user.phone_number, "That quantity is invalid. Send *menu* to start again.")
             return
         return await handle_add_item(session, user, int(quantity_parts[0]), int(quantity_parts[1]))
-    if rid == "carts" or text in {"cart", "carts"}:
+    if rid in {"carts", "cart:view"} or text in {"cart", "carts"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
         return await show_carts(session, user)
@@ -507,6 +661,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     if rid == "clearcart" or text in {"clear cart", "clearcart"}:
         _clear_typed_draft(user.phone_number)
         _KITCHEN_NOTES.pop(user.phone_number, None)
+        _PRESELECTED_AREA.pop(user.phone_number, None)
         if session is not None:
             await order_service.clear_user_carts(session, user.id)
         await whatsapp.send_text(user.phone_number, "🗑️ Your cart has been cleared. Send *menu* to pick new items.")
@@ -521,7 +676,7 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
             await whatsapp.send_text(user.phone_number, "That cart could not be found.")
             return
         return await toggle_cart(session, user, int(cart_text))
-    if rid == "checkout" or text in {"checkout", "check out"}:
+    if rid in {"checkout", "checkout:start"} or text in {"checkout", "check out"}:
         _CUSTOM_QTY_ITEM.pop(user.phone_number, None)
         _clear_typed_draft(user.phone_number)
         return await handle_checkout(session, user)
@@ -532,10 +687,11 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
     if open_fulfillment is not None:
         return await handle_checkout_flow(session, user, open_fulfillment, msg)
 
-    # Free-text typed order auto-detection during browsing / cart building
+    # Free-text typed order auto-detection directly from anywhere during browsing / cart building
     if not rid and raw_text and session is not None:
         catalog = await menu_service.get_all_items(session)
-        draft = order_parser.parse_typed_order(raw_text, catalog)
+        areas = list((await session.execute(select(DeliveryArea).where(DeliveryArea.is_active.is_(True)))).scalars())
+        draft = order_parser.parse_typed_order(raw_text, catalog, areas=areas)
         if draft.has_any_recognition:
             return await start_typed_order_draft(session, user, draft)
         if user.phone_number in _TYPED_ORDER_PROMPTED:
@@ -551,15 +707,16 @@ async def handle_incoming(session: AsyncSession, msg: IncomingMessage) -> None:
 
     await whatsapp.send_text(
         user.phone_number,
-        "Hi! Send *menu* to see what's available right now, or reply *staff* to chat with our team.",
+        "Hi! Send *menu* to pick an item, or just type what you'd like (e.g. *2 jollof rice, 1 coke*). Reply *HELP* for staff.",
     )
 
 
 async def handle_go_back_browsing(session: AsyncSession, user: User) -> None:
     """Handle `⬅ Go back` (`nav:back` or `back`) during browsing, typed orders, and cart building."""
     if user.phone_number in _CUSTOM_QTY_ITEM:
-        item_id = _CUSTOM_QTY_ITEM.pop(user.phone_number)
-        return await show_quantity_selection(session, user, item_id)
+        entry = _CUSTOM_QTY_ITEM.pop(user.phone_number)
+        item_id, qty_mode = entry if isinstance(entry, tuple) else (entry, "add")
+        return await show_quantity_selection(session, user, item_id, mode=qty_mode)
 
     draft = _get_typed_draft(user.phone_number)
     if draft is not None:
@@ -585,7 +742,10 @@ async def handle_go_back_browsing(session: AsyncSession, user: User) -> None:
         if kind == "category":
             return await handle_category_selected(session, user, prev["category"], prev.get("page", 0))
         if kind == "quantity":
-            return await show_quantity_selection(session, user, prev["item_id"])
+            return await show_quantity_selection(session, user, prev["item_id"], mode=prev.get("mode", "set"))
+        if kind == "hub":
+            item = await menu_service.get_item(session, prev["item_id"]) if prev.get("item_id") else None
+            return await send_addon_hub(session, user, last_item=item, added_qty=prev.get("qty", 1))
         if kind == "carts":
             return await show_carts(session, user)
         if kind == "menu":
@@ -893,82 +1053,122 @@ async def handle_menu_request(session: AsyncSession | None, user: User, page: in
         return
 
     _push_nav(user.phone_number, {"kind": "menu", "page": page})
-    total_qty, subtotal = await order_service.get_user_cart_summary(session, user.id)
+    total_qty, subtotal, pack_fee = await order_service.get_user_cart_totals(session, user.id)
     last_order = await order_service.get_last_order(session, user.id) if total_qty == 0 else None
+    saved, saved_area = await _active_saved_address(session, user.id)
+    has_saved = saved is not None and saved_area is not None
+    _journey_update(
+        user.phone_number,
+        mode="browse",
+        has_saved=has_saved,
+        preselected_area=user.phone_number in _PRESELECTED_AREA,
+        fulfillment=None,
+    )
 
-    total_pages = (len(categories) + CATEGORY_PAGE_SIZE - 1) // CATEGORY_PAGE_SIZE
-    page = min(max(page, 0), total_pages - 1)
-    start = page * CATEGORY_PAGE_SIZE
+    page0_cats = [c for c in menu_service.STEP1_PRIMARY_CATEGORIES if c in categories]
+    if not page0_cats:
+        page0_cats = categories[:3]
+    more_cats = [c for c in categories if c not in page0_cats]
 
-    rows: list[dict] = []
-    if page == 0:
-        if total_qty > 0:
-            rows.append({
-                "id": "checkout",
-                "title": "✅ Proceed to checkout",
-                "description": f"{total_qty} item(s), {naira(subtotal)}",
-            })
-        elif last_order is not None:
-            last_items = ", ".join(f"{oi.quantity}x {menu_service.friendly_item_name(oi.item_name)}" for oi in last_order.items[:2])
-            if len(last_order.items) > 2:
-                last_items += f" +{len(last_order.items) - 2} more"
-            rows.append({
-                "id": "repeat:last",
-                "title": "🔁 Repeat my last order",
-                "description": last_items[:60],
-            })
+    if page > 0 and more_cats:
+        per_page = _effective_menu_page_size()
+        extra_pages = max(1, (len(more_cats) + per_page - 1) // per_page)
+        extra_page = min(page - 1, extra_pages - 1)
+        start = extra_page * per_page
+        slice_cats = more_cats[start:start + per_page]
+        rows: list[dict] = [
+            {
+                "id": f"cat:{c}",
+                "title": menu_service.friendly_category_name(c),
+                "aliases": [c],
+            }
+            for c in slice_cats
+        ]
+        if start + per_page < len(more_cats):
+            rows.append({"id": f"menupg:{extra_page + 2}", "title": "More categories"})
+        if extra_page > 0:
+            rows.append({"id": f"menupg:{extra_page}", "title": "⬅ Previous categories"})
+        else:
+            rows.append({"id": "menu", "title": "⬅ Main menu"})
+        rows.append({"id": "nav:back", "title": "⬅ Go back"})
+        cart_line = await _cart_status_line(session, user.id)
+        body = _format_poll_header(
+            f"{_step_label(user.phone_number, 'welcome')} · More Categories ({extra_page + 1}/{extra_pages})",
+            cart_line if total_qty > 0 else "Pick a category below:",
+        )
+        await whatsapp.send_list(user.phone_number, body, "More options", "Categories", rows)
+        return
 
-    for c in categories[start:start + CATEGORY_PAGE_SIZE]:
+    catalog = await menu_service.get_all_items(session)
+    heroes = menu_service.resolve_hero_options(catalog)
+
+    rows = []
+    if total_qty > 0:
+        rows.append({
+            "id": "checkout",
+            "title": "✅ Checkout Now",
+            "description": f"{total_qty} item(s), {naira(subtotal + pack_fee)}",
+        })
+    elif last_order is not None:
+        last_items = ", ".join(
+            f"{oi.quantity}x {menu_service.friendly_item_name(oi.item_name)}" for oi in last_order.items[:2]
+        )
+        if len(last_order.items) > 2:
+            last_items += f" +{len(last_order.items) - 2} more"
+        rows.append({
+            "id": "repeat:last",
+            "title": "⚡ Repeat Last Order",
+            "description": f"{last_items} · {naira(last_order.total_amount)}"[:72],
+        })
+
+    for hero in heroes:
+        rows.append({
+            "id": hero["id"],
+            "title": hero["title"],
+            "description": hero["description"],
+        })
+
+    for c in page0_cats:
         rows.append({
             "id": f"cat:{c}",
             "title": menu_service.friendly_category_name(c),
             "aliases": [c],
         })
 
-    if page == 0:
+    if more_cats:
+        more_preview = ", ".join(menu_service.friendly_category_name(c).split(" ", 1)[-1] for c in more_cats[:3])
+        if len(more_cats) > 3:
+            more_preview += "…"
         rows.append({
-            "id": "typeorder:start",
-            "title": "✍️ Type your order",
-            "description": "Type all your items in one message",
+            "id": "menupg:1",
+            "title": "📂 More Categories",
+            "description": more_preview[:72],
         })
 
-    if start + CATEGORY_PAGE_SIZE < len(categories):
-        rows.append({"id": f"menupg:{page + 1}", "title": "More categories"})
-    if page > 0:
-        rows.append({"id": f"menupg:{page - 1}", "title": "⬅ Previous categories"})
-    if total_qty > 0:
-        rows.append({"id": "cancel", "title": "❌ Cancel order"})
-    if page == 0:
-        rows.append({
-            "id": "staff:escalate",
-            "title": "💬 Talk to staff",
-            "description": "Pause bot & chat with our team",
-        })
+    rows.append({
+        "id": "staff:escalate",
+        "title": "💬 Talk to staff",
+        "description": "Pause bot & chat with our team",
+    })
 
+    step_lbl = _step_label(user.phone_number, "welcome")
     if total_qty > 0:
-        body = (
-            f"Step 1 of 6: Pick a category\n"
-            f"🛒 Cart: {total_qty} item{'s' if total_qty != 1 else ''} ({naira(subtotal)})\n"
-            f"Tap a category to add more or check out:"
-        )
+        cart_total = subtotal + pack_fee
+        title_line = f"{step_lbl} · 🛒 Cart {naira(cart_total)}"
+        ctx = "Tap a combo, pick a category, or type your order:"
     elif last_order is not None:
-        body = (
-            f"👋 Welcome back to {settings.brand_name}!\n"
-            f"Step 1 of 6: Pick a category\n"
-            f"Tap an option below or repeat your last order:"
-        )
+        title_line = f"{step_lbl} · 👋 Welcome back to {settings.brand_name}!"
+        ctx = "Tap Repeat, pick a combo/category, or type your order:"
     else:
-        body = (
-            f"👋 Welcome to {settings.brand_name}!\n"
-            f"Step 1 of 6: Pick a category\n"
-            f"Tap an option below to start your order:"
-        )
+        title_line = f"{step_lbl} · 👋 {settings.brand_name}"
+        ctx = "Tap a combo, pick a category, or just type your order (e.g. 2 jollof, 1 coke):"
 
-    await whatsapp.send_list(user.phone_number, body, "View menu", "Categories", rows)
+    body = _format_poll_header(title_line, ctx)
+    await whatsapp.send_list(user.phone_number, body, "View menu", "Quick Menu", rows)
 
 
 async def handle_repeat_last_order(session: AsyncSession, user: User) -> None:
-    """Fast path for repeat customers (Principle 9): load items from their last order into cart."""
+    """Fast path for repeat customers (Principle 9): load last order and jump to Summary when saved address exists."""
     last_order = await order_service.get_last_order(session, user.id)
     if last_order is None or not last_order.items:
         await whatsapp.send_text(user.phone_number, "We couldn't find a previous order to repeat. Let's start a new one!")
@@ -1007,28 +1207,34 @@ async def handle_repeat_last_order(session: AsyncSession, user: User) -> None:
             f"so we added the available items ({', '.join(added_names)}).",
         )
 
+    saved, saved_area = await _active_saved_address(session, user.id)
+    if saved is not None and saved_area is not None:
+        _journey_update(
+            user.phone_number,
+            mode="repeat",
+            has_saved=True,
+            preselected_area=False,
+            fulfillment="delivery",
+        )
+        return await handle_checkout(session, user)
+
     lines = await order_service.get_cart(session, cart.id)
-    subtotal = order_service.cart_subtotal(lines)
     total_qty = sum(c.quantity for c, _ in lines)
+    _journey_update(
+        user.phone_number,
+        mode="quick",
+        has_saved=False,
+        preselected_area=user.phone_number in _PRESELECTED_AREA,
+        fulfillment=None,
+    )
     user.current_state = SessionState.ADDING_TO_CART
     _push_nav(user.phone_number, {"kind": "carts"})
-
-    await whatsapp.send_buttons(
-        user.phone_number,
-        (
-            f"Step 4 of 6: Repeat order loaded!\n"
-            f"✅ Added: {', '.join(added_names)}\n"
-            f"🛒 Cart: {total_qty} item(s) · Subtotal: {naira(subtotal)}\n"
-            f"Ready to check out or want to add extras?"
-        ),
-        [
-            ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
-            ("cat:Drinks", "🥤 Add a Cold Drink"),
-            ("menu", "🍛 Add another item"),
-            ("carts", "🛒 View / Edit cart"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
-        ],
+    await send_addon_hub(
+        session,
+        user,
+        last_item=None,
+        added_qty=total_qty,
+        hub_title=f"⚡ Repeat order loaded ({', '.join(added_names)})",
     )
 
 
@@ -1038,45 +1244,154 @@ async def handle_repeat_last_order(session: AsyncSession, user: User) -> None:
 
 
 async def prompt_typed_order(user: User) -> None:
-    """Explicit handoff to free text when customer taps `✍️ Type your order` (Principle 8)."""
+    """Explicit handoff to free text when customer requests `typeorder:retype` / `typeorder:start`."""
     _TYPED_ORDER_DRAFTS.pop(user.phone_number, None)
     _TYPED_ORDER_PROMPTED.add(user.phone_number)
     user.current_state = SessionState.ADDING_TO_CART
+    step_lbl = _step_label(user.phone_number, "typed_prompt")
     await whatsapp.send_text(
         user.phone_number,
         (
-            "✍️ *TYPE YOUR ORDER BELOW (Step 2 of 6)*\n"
+            f"✍️ *TYPE YOUR ORDER BELOW ({step_lbl})*\n"
             "Send all the items you want in one message.\n\n"
             "💡 *Examples:*\n"
             "• _2 jollof rice, 1 fried rice, 2 chicken medium, 1 plantain, 2 coke_\n"
-            "• _jollof of 800, 1 beef, 1 dodo, 1 eva water_\n"
-            "• _1 large shawarma extra pepper no sausage, 1 hollandia_\n\n"
+            "• _jollof 2 fried 2 turkey 1 plantain 800_\n"
+            "• _2 jollof rice, 1 coke to Akute_\n\n"
             "_(Or reply *BACK* to pick from the menu, or *CANCEL* to cancel)_"
         ),
     )
 
 
+async def _send_fast_typed_cart_summary(
+    session: AsyncSession,
+    user: User,
+    *,
+    area_name: str | None = None,
+    had_prior_items: bool = False,
+    notes_summary: str = "",
+) -> None:
+    """Send itemized Cart Summary Card + single Action Poll immediately for high-confidence typed orders."""
+    cart = await order_service.get_or_create_cart(session, user.id)
+    lines = await order_service.get_cart(session, cart.id)
+    total_qty, items_sub, pack_fee = await order_service.get_user_cart_totals(session, user.id)
+    total = items_sub + pack_fee
+
+    item_bullets = "\n".join(
+        f"• {c.quantity} x {menu_service.friendly_item_name(m.name)} — {naira(m.price * c.quantity)}"
+        for c, m in lines
+    )
+    sections: list[str] = [
+        f"📝 *ADDED TO YOUR CART ({_step_label(user.phone_number, 'carts')})*",
+        item_bullets or "• _(Cart empty)_",
+    ]
+    if area_name:
+        sections.append(f"📍 *Delivery area matched:* {area_name}")
+    if notes_summary:
+        sections.append(f"📝 *Kitchen note:* {notes_summary}")
+
+    pack_line = _pack_summary_line(pack_fee)
+    breakdown = f"• Items subtotal: {naira(items_sub)}\n{pack_line}━━━━━━━━━━━━━━━━━━\n*Cart Total:* {naira(total)}"
+    sections.append(breakdown)
+    await whatsapp.send_text(user.phone_number, "\n\n".join(sections))
+
+    buttons: list[tuple[str, str]] = [
+        ("checkout", f"✅ Confirm & Checkout ({naira(total)})"),
+    ]
+    if had_prior_items:
+        buttons.append(("typeorder:replace_prev", "🔄 Replace previous cart instead"))
+    buttons.extend([
+        ("carts", "✏️ Edit Cart"),
+        ("menu", "➕ Add More Items"),
+        ("nav:back", "⬅ Go back"),
+    ])
+    header = _format_poll_header(
+        f"{_step_label(user.phone_number, 'carts')} · 🛒 Cart {naira(total)}",
+        f"Got {total_qty} item(s). Ready to checkout?",
+    )
+    await whatsapp.send_buttons(user.phone_number, header, buttons)
+
+
 async def start_typed_order_draft(
     session: AsyncSession, user: User, draft: order_parser.ParsedOrderDraft
 ) -> None:
-    """Begin processing a parsed free-text order draft (check existing cart first, then follow-ups)."""
+    """Fast-forward unambiguous typed orders directly into cart; ask <=2 checks only when ambiguous."""
     _TYPED_ORDER_PROMPTED.discard(user.phone_number)
     user.current_state = SessionState.ADDING_TO_CART
-    total_qty, subtotal = await order_service.get_user_cart_summary(session, user.id)
+    saved, saved_area = await _active_saved_address(session, user.id)
+    has_saved = saved is not None and saved_area is not None
+
+    if draft.is_high_confidence:
+        _clear_typed_draft(user.phone_number)
+        cart = await order_service.get_or_create_cart(session, user.id)
+        existing_lines = await order_service.get_cart(session, cart.id)
+        had_prior_items = bool(existing_lines)
+        in_cart_map = {m.id: c.quantity for c, m in existing_lines}
+
+        typed_snapshot: list[tuple[int, int, str | None]] = []
+        for m in draft.matched:
+            item = await menu_service.get_item(session, m.item_id)
+            if item is None or not item.is_available:
+                continue
+            limit = item.sellable_units
+            already = in_cart_map.get(item.id, 0)
+            qty_to_add = m.quantity if limit is None else max(0, min(m.quantity, limit - already))
+            if qty_to_add <= 0:
+                continue
+            await order_service.add_to_cart(session, user.id, item.id, quantity=qty_to_add, cart_id=cart.id)
+            in_cart_map[item.id] = already + qty_to_add
+            typed_snapshot.append((item.id, qty_to_add, ", ".join(m.notes) if m.notes else None))
+
+        if not typed_snapshot:
+            return await prompt_typed_order(user)
+
+        _LAST_TYPED_ITEMS[user.phone_number] = typed_snapshot
+        notes_summary = draft.kitchen_notes_summary()
+        if notes_summary:
+            prev_notes = _KITCHEN_NOTES.get(user.phone_number)
+            _KITCHEN_NOTES[user.phone_number] = f"{prev_notes}; {notes_summary}" if prev_notes else notes_summary
+
+        if draft.matched_area_id and draft.matched_area_name:
+            _PRESELECTED_AREA[user.phone_number] = (draft.matched_area_id, draft.matched_area_name)
+
+        _journey_update(
+            user.phone_number,
+            mode="quick",
+            has_saved=has_saved,
+            preselected_area=bool(draft.matched_area_id),
+            fulfillment=None,
+        )
+        _push_nav(user.phone_number, {"kind": "carts"})
+        await _send_fast_typed_cart_summary(
+            session,
+            user,
+            area_name=draft.matched_area_name,
+            had_prior_items=had_prior_items,
+            notes_summary=_KITCHEN_NOTES.get(user.phone_number, ""),
+        )
+        return
+
+    _journey_update(
+        user.phone_number,
+        mode="quick",
+        has_saved=has_saved,
+        preselected_area=bool(draft.matched_area_id),
+        fulfillment=None,
+    )
+    total_qty, subtotal, pack_fee = await order_service.get_user_cart_totals(session, user.id)
     if total_qty > 0:
         draft.awaiting_cart_mode = True
         _set_typed_draft(user.phone_number, draft)
         await whatsapp.send_buttons(
             user.phone_number,
-            (
-                f"Step 2 of 6: You already have {total_qty} item{'s' if total_qty != 1 else ''} ({naira(subtotal)}) in your cart\n"
-                f"How should we handle your typed order?"
+            _format_poll_header(
+                f"{_step_label(user.phone_number, 'typed_followup')} · Cart {naira(subtotal + pack_fee)}",
+                f"You already have {total_qty} item(s). How should we handle your typed order?",
             ),
             [
                 ("typeorder:mode:add", f"➕ Add to my cart ({total_qty} item{'s' if total_qty != 1 else ''})"),
                 ("typeorder:mode:replace", "🔄 Replace my cart with this order"),
                 ("nav:back", "⬅ Go back"),
-                ("cancel", "❌ Cancel order"),
             ],
         )
         return
@@ -1085,6 +1400,35 @@ async def start_typed_order_draft(
     draft.cart_mode = "add"
     _set_typed_draft(user.phone_number, draft)
     await _advance_typed_order(session, user, draft)
+
+
+async def handle_typed_order_replace_prev(session: AsyncSession, user: User) -> None:
+    """Replace the previous cart items with only the most recently fast-forwarded typed order."""
+    snap = _LAST_TYPED_ITEMS.get(user.phone_number)
+    if not snap:
+        return await handle_menu_request(session, user, 0)
+    cart = await order_service.get_or_create_cart(session, user.id)
+    await order_service.clear_cart(session, cart.id)
+    note_parts: list[str] = []
+    for item_id, qty, item_notes in snap:
+        item = await menu_service.get_item(session, item_id)
+        if item is not None and item.is_available:
+            await order_service.add_to_cart(session, user.id, item.id, quantity=qty, cart_id=cart.id)
+            if item_notes:
+                note_parts.append(f"{menu_service.friendly_item_name(item.name)} ({item_notes})")
+    notes_summary = "; ".join(note_parts)
+    if notes_summary:
+        _KITCHEN_NOTES[user.phone_number] = notes_summary
+    else:
+        _KITCHEN_NOTES.pop(user.phone_number, None)
+    pre_area = _PRESELECTED_AREA.get(user.phone_number)
+    await _send_fast_typed_cart_summary(
+        session,
+        user,
+        area_name=pre_area[1] if pre_area else None,
+        had_prior_items=False,
+        notes_summary=notes_summary,
+    )
 
 
 async def handle_typed_order_mode(session: AsyncSession, user: User, mode: str) -> None:
@@ -1107,11 +1451,12 @@ async def _advance_typed_order(
         total_q = len(draft.followups)
         q = draft.followups[idx]
         buttons: list[tuple[str, str]] = []
+        step_lbl = _step_label(user.phone_number, "typed_followup")
 
         if q.kind == "size":
-            body = (
-                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
-                f"Which size of *{q.family_label}* would you like for *\"{q.raw_phrase}\"*?"
+            body = _format_poll_header(
+                f"{step_lbl} · Quick check {idx + 1} of {total_q}",
+                f"Which size of *{q.family_label}* would you like for *\"{q.raw_phrase}\"*?",
             )
             for item_id, display_name, unit_price in q.options:
                 opt_qty = q.quantity
@@ -1122,17 +1467,17 @@ async def _advance_typed_order(
                 )
                 buttons.append((f"typeorder:pick:{item_id}:{opt_qty}", label))
         elif q.kind == "naira_mismatch":
-            body = (
-                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
-                f"*{q.family_label}* doesn't divide evenly into {naira(Decimal(q.naira_amount or 0))}. Which option would you like?"
+            body = _format_poll_header(
+                f"{step_lbl} · Quick check {idx + 1} of {total_q}",
+                f"*{q.family_label}* doesn't divide into {naira(Decimal(q.naira_amount or 0))}. Pick one:",
             )
             for opt_i, (item_id, display_name, opt_total) in enumerate(q.options):
                 opt_qty = q.quantity + opt_i
                 buttons.append((f"typeorder:pick:{item_id}:{opt_qty}", f"{display_name} ({naira(opt_total)})"))
         else:
-            body = (
-                f"Step 2 of 6: Quick check {idx + 1} of {total_q}\n"
-                f"We couldn't find *\"{q.raw_phrase}\"*. Did you mean:"
+            body = _format_poll_header(
+                f"{step_lbl} · Quick check {idx + 1} of {total_q}",
+                f"We couldn't find *\"{q.raw_phrase}\"*. Did you mean:",
             )
             for item_id, display_name, unit_price in q.options:
                 opt_qty = q.quantity
@@ -1142,7 +1487,6 @@ async def _advance_typed_order(
 
         buttons.append(("typeorder:skip", f"❌ Remove \"{q.raw_phrase[:20]}\""))
         buttons.append(("nav:back", "⬅ Go back"))
-        buttons.append(("cancel", "❌ Cancel order"))
         await whatsapp.send_buttons(user.phone_number, body, buttons)
         return
 
@@ -1185,8 +1529,9 @@ async def handle_typed_order_skip(session: AsyncSession, user: User) -> None:
 async def _send_typed_order_confirmation(
     session: AsyncSession, user: User, draft: order_parser.ParsedOrderDraft
 ) -> None:
-    """Send the itemized plain-text breakdown of the parsed order followed by the confirmation poll."""
-    sections: list[str] = ["📝 *WE UNDERSTOOD YOUR ORDER (Step 3 of 6)*"]
+    """Send the itemized plain-text breakdown of an ambiguous/partial typed order followed by action poll."""
+    step_lbl = _step_label(user.phone_number, "carts")
+    sections: list[str] = [f"📝 *WE UNDERSTOOD YOUR ORDER ({step_lbl})*"]
 
     if draft.matched:
         item_lines: list[str] = []
@@ -1217,11 +1562,14 @@ async def _send_typed_order_confirmation(
         unmatched_str = ", ".join(f'"{u}"' for u in draft.unmatched)
         sections.append(f"⚠️ *Couldn't find on our menu:* {unmatched_str}")
 
+    if draft.matched_area_name:
+        sections.append(f"📍 *Delivery area matched:* {draft.matched_area_name}")
+
     notes_summary = draft.kitchen_notes_summary()
     if notes_summary:
         sections.append(f"📝 *Kitchen note:* {notes_summary}")
 
-    sections.append(f"━━━━━━━━━━━━━━━━━━\n*Order Subtotal:* {naira(draft.subtotal)}")
+    sections.append(f"━━━━━━━━━━━━━━━━━━\n*Items Subtotal:* {naira(draft.subtotal)}")
     await whatsapp.send_text(user.phone_number, "\n\n".join(sections))
 
     buttons: list[tuple[str, str]] = []
@@ -1239,11 +1587,13 @@ async def _send_typed_order_confirmation(
     buttons.append(("menu", "🍛 Pick from menu instead"))
     buttons.append(("staff:escalate", "💬 Talk to staff"))
     buttons.append(("nav:back", "⬅ Go back"))
-    buttons.append(("cancel", "❌ Cancel order"))
 
     await whatsapp.send_buttons(
         user.phone_number,
-        "Step 3 of 6: Confirm your typed order\nTap below to add these items to your cart or make changes:",
+        _format_poll_header(
+            f"{step_lbl} · Confirm your typed order",
+            "Tap below to add these items to your cart or make changes:",
+        ),
         buttons,
     )
 
@@ -1266,7 +1616,7 @@ async def handle_typed_order_alt(session: AsyncSession, user: User, alt_id_str: 
 
 
 async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
-    """Commit all confirmed items from the typed order draft into the customer's cart and show Step 4."""
+    """Commit confirmed items from a disambiguated typed order draft into cart and open Add-On Hub."""
     draft = _get_typed_draft(user.phone_number)
     if draft is None or not draft.matched:
         return await prompt_typed_order(user)
@@ -1281,6 +1631,7 @@ async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
     in_cart_map = {m.id: c.quantity for c, m in existing_lines}
 
     added_labels: list[str] = []
+    added_qty = 0
     for m in draft.matched:
         item = await menu_service.get_item(session, m.item_id)
         if item is None or not item.is_available:
@@ -1292,6 +1643,7 @@ async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
             continue
         await order_service.add_to_cart(session, user.id, item.id, quantity=qty_to_add, cart_id=cart.id)
         in_cart_map[item.id] = already + qty_to_add
+        added_qty += qty_to_add
         added_labels.append(f"{qty_to_add}x {m.display_name}")
 
     notes_summary = draft.kitchen_notes_summary()
@@ -1299,9 +1651,9 @@ async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
         prev_notes = _KITCHEN_NOTES.get(user.phone_number)
         _KITCHEN_NOTES[user.phone_number] = f"{prev_notes}; {notes_summary}" if prev_notes else notes_summary
 
-    lines = await order_service.get_cart(session, cart.id)
-    subtotal = order_service.cart_subtotal(lines)
-    total_qty = sum(c.quantity for c, _ in lines)
+    if draft.matched_area_id and draft.matched_area_name:
+        _PRESELECTED_AREA[user.phone_number] = (draft.matched_area_id, draft.matched_area_name)
+
     user.current_state = SessionState.ADDING_TO_CART
     _push_nav(user.phone_number, {"kind": "carts"})
 
@@ -1309,25 +1661,12 @@ async def handle_typed_order_confirm(session: AsyncSession, user: User) -> None:
     if len(added_labels) > 3:
         added_preview += f" +{len(added_labels) - 3} more"
 
-    await whatsapp.send_buttons(
-        user.phone_number,
-        (
-            f"Step 4 of 6: Anything else with your order?\n"
-            f"✅ Added: {added_preview or 'your items'}\n"
-            f"🛒 Cart: {total_qty} item(s) · Subtotal: {naira(subtotal)}\n"
-            f"Choose an add-on or proceed to checkout:"
-        ),
-        [
-            ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
-            ("cat:Protein 2", "🍗 Add Grilled Chicken"),
-            ("cat:Protein 3", "🦃 Add Grilled Turkey"),
-            ("cat:Protein 1", "🥩 Add Beef, Fish, Plantain or Extras"),
-            ("cat:Drinks", "🥤 Add a Cold Drink"),
-            ("menu", "🍛 Add another meal or snack"),
-            ("carts", "🛒 View / Edit cart"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
-        ],
+    await send_addon_hub(
+        session,
+        user,
+        last_item=None,
+        added_qty=added_qty,
+        hub_title=f"✅ Added: {added_preview or 'your items'}",
     )
 
 
@@ -1340,11 +1679,18 @@ async def handle_category_selected(
         await whatsapp.send_text(user.phone_number, f"Nothing in {menu_service.friendly_category_name(category)} is available right now.")
         return
 
+    saved, saved_area = await _active_saved_address(session, user.id)
+    _journey_update(
+        user.phone_number,
+        mode="browse",
+        has_saved=saved is not None and saved_area is not None,
+    )
     _push_nav(user.phone_number, {"kind": "category", "category": category, "page": page})
-    total_pages = (len(items) + MENU_PAGE_SIZE - 1) // MENU_PAGE_SIZE
+    page_size = _effective_menu_page_size()
+    total_pages = (len(items) + page_size - 1) // page_size
     page = min(max(page, 0), total_pages - 1)
-    start = page * MENU_PAGE_SIZE
-    end = start + MENU_PAGE_SIZE
+    start = page * page_size
+    end = start + page_size
 
     rows: list[dict] = [
         {
@@ -1356,32 +1702,139 @@ async def handle_category_selected(
         for i in items[start:end]
     ]
 
-    # Single-poll pagination & escape routes (Principle 1 & Principle 6: never send 2 polls at once)
+    # Single-poll pagination & nav back (0=cancel, HELP=staff via hidden global shortcuts)
     if page < total_pages - 1:
         rows.append({"id": f"catpg:{category}:{page + 1}", "title": f"➕ See more (Page {page + 2}/{total_pages})"})
     if page > 0:
         rows.append({"id": f"catpg:{category}:{page - 1}", "title": f"⬅ Previous (Page {page}/{total_pages})"})
     rows.append({"id": "nav:back", "title": "⬅ Go back"})
-    rows.append({"id": "cancel", "title": "❌ Cancel order"})
 
     friendly_cat = menu_service.friendly_category_name(category)
     cart_line = await _cart_status_line(session, user.id)
-    if total_pages > 1:
-        heading = (
-            f"Step 2 of 6: Pick an item ({friendly_cat} · Page {page + 1}/{total_pages})\n"
-            f"{cart_line}\n"
-            f"Tap an item or see more options:"
-        )
-    else:
-        heading = (
-            f"Step 2 of 6: Pick an item ({friendly_cat})\n"
-            f"{cart_line}\n"
-            f"Tap an item to choose your quantity:"
-        )
+    step_lbl = _step_label(user.phone_number, "category")
+    page_tag = f" · Page {page + 1}/{total_pages}" if total_pages > 1 else ""
+    heading = _format_poll_header(
+        f"{step_lbl} · {friendly_cat}{page_tag}",
+        f"{cart_line} · Tap any item to add:",
+    )
     await whatsapp.send_list(user.phone_number, heading, "Choose item", category, rows)
 
 
-async def show_quantity_selection(session: AsyncSession, user: User, item_id: int) -> None:
+async def send_addon_hub(
+    session: AsyncSession,
+    user: User,
+    *,
+    last_item: MenuItem | None,
+    added_qty: int = 1,
+    hub_title: str | None = None,
+) -> None:
+    """Optimistic Add-On & Checkout Hub Poll (inline +1 / Change Qty + 4 direct 1-tap add-ons)."""
+    cart = await order_service.get_or_create_cart(session, user.id)
+    lines = await order_service.get_cart(session, cart.id)
+    total_qty, items_sub, pack_fee = await order_service.get_user_cart_totals(session, user.id)
+    cart_total = items_sub + pack_fee
+    cart_item_ids = {m.id for _, m in lines}
+
+    catalog = await menu_service.get_all_items(session)
+    addons = menu_service.get_contextual_addons(catalog, last_item, cart_item_ids, limit=4)
+
+    user.current_state = SessionState.ADDING_TO_CART
+    _push_nav(
+        user.phone_number,
+        {"kind": "hub", "item_id": last_item.id if last_item else None, "qty": added_qty},
+    )
+
+    step_lbl = _step_label(user.phone_number, "hub")
+    if hub_title:
+        lead = hub_title
+    elif last_item is not None:
+        in_cart_qty = next((c.quantity for c, m in lines if m.id == last_item.id), added_qty)
+        lead = f"✅ Added {added_qty}x {menu_service.friendly_item_name(last_item.name)} ({in_cart_qty} in cart)"
+    else:
+        lead = f"🛒 {total_qty} item(s) in cart"
+
+    pack_note = f" (incl. {naira(pack_fee)} pack)" if pack_fee > 0 else ""
+    title_line = f"{step_lbl} · 🛒 {naira(cart_total)}{pack_note}"
+    body = _format_poll_header(title_line, f"{lead}. Add extras or checkout?")
+
+    buttons: list[tuple[str, str]] = [
+        ("checkout", f"💳 Checkout Now ({naira(cart_total)})"),
+    ]
+    if last_item is not None:
+        short_name = _short_item_name(last_item.name, 16)
+        buttons.append((f"qty_inc:{last_item.id}:1", f"➕ Add 1 more {short_name} (+{naira(last_item.price)})"))
+        buttons.append((f"qty_menu:{last_item.id}", f"🔢 Change {short_name} Qty"))
+
+    for addon, a_qty in addons:
+        addon_name = _short_item_name(addon.name, 16)
+        qty_tag = f" ×{a_qty}" if a_qty > 1 else ""
+        buttons.append((f"quick_add:{addon.id}", f"➕ {addon_name}{qty_tag} ({naira(addon.price * a_qty)})"))
+
+    buttons.append(("menu", "📂 Browse Full Menu"))
+    buttons.append(("carts", "🛒 View / Edit Cart"))
+    buttons.append(("nav:back", "⬅ Go back"))
+
+    await whatsapp.send_buttons(user.phone_number, body, buttons)
+
+
+async def handle_bundle_add(session: AsyncSession, user: User, bundle_id: str) -> None:
+    """Resolve and optimistically add a Step 1 hero combo bundle (with live protein fallback)."""
+    catalog = await menu_service.get_all_items(session)
+    heroes = menu_service.resolve_hero_options(catalog)
+    hero = next((h for h in heroes if h["id"] == bundle_id), None)
+    if hero is None:
+        await whatsapp.send_text(
+            user.phone_number,
+            "Sorry, part of that combo just ran out. Here is what's currently available:",
+        )
+        return await handle_menu_request(session, user, 0)
+
+    cart = await order_service.get_or_create_cart(session, user.id)
+    lines = await order_service.get_cart(session, cart.id)
+    in_cart_map = {m.id: c.quantity for c, m in lines}
+
+    for item, needed in hero["items"]:
+        limit = item.sellable_units
+        already = in_cart_map.get(item.id, 0)
+        if limit is not None and already + needed > limit:
+            await whatsapp.send_buttons(
+                user.phone_number,
+                f"⚠️ Only {limit} {menu_service.friendly_item_name(item.name)} available (you have {already} in cart).",
+                [("menu", "📂 Browse Full Menu"), ("checkout", "✅ Checkout"), ("nav:back", "⬅ Go back")],
+            )
+            return
+
+    added_total = 0
+    for item, needed in hero["items"]:
+        await order_service.add_to_cart(session, user.id, item.id, quantity=needed, cart_id=cart.id)
+        added_total += needed
+
+    saved, saved_area = await _active_saved_address(session, user.id)
+    _journey_update(
+        user.phone_number,
+        mode="quick",
+        has_saved=saved is not None and saved_area is not None,
+    )
+    await send_addon_hub(
+        session,
+        user,
+        last_item=None,
+        added_qty=added_total,
+        hub_title=f"✅ Added {hero['title']}",
+    )
+
+
+async def handle_optimistic_add(session: AsyncSession, user: User, item_id: int) -> None:
+    """Immediately insert default portion (2 for Plantain, 1 otherwise) and show Add-On Hub."""
+    item = await menu_service.get_item(session, item_id)
+    if item is None or not item.is_available:
+        await whatsapp.send_text(user.phone_number, "Sorry, that item just ran out. Send *menu* to pick something else.")
+        return
+    qty = menu_service.default_tap_quantity(item)
+    await handle_add_item(session, user, item_id, qty)
+
+
+async def show_quantity_selection(session: AsyncSession, user: User, item_id: int, *, mode: str = "set") -> None:
     item: MenuItem | None = await menu_service.get_item(session, item_id)
     if item is None or not item.is_available:
         await whatsapp.send_text(
@@ -1390,7 +1843,7 @@ async def show_quantity_selection(session: AsyncSession, user: User, item_id: in
         )
         return
     available_quantity = item.sellable_units
-    if available_quantity is not None:
+    if mode != "set" and available_quantity is not None:
         in_cart = 0
         if user.active_cart_id is not None:
             cart = await session.get(Cart, user.active_cart_id)
@@ -1405,13 +1858,14 @@ async def show_quantity_selection(session: AsyncSession, user: User, item_id: in
         await whatsapp.send_text(user.phone_number, f"Sorry, {menu_service.friendly_item_name(item.name)} is sold out.")
         return
 
-    _push_nav(user.phone_number, {"kind": "quantity", "item_id": item.id, "category": item.category})
+    _push_nav(user.phone_number, {"kind": "quantity", "item_id": item.id, "category": item.category, "mode": mode})
 
-    # Principle 5: Smart quantity handling (1 / 2 / 3 / 4 / 5+ with prices inside options)
     direct_max = min(4, max_quantity)
+    prefix = "qtyset" if mode == "set" else "qty"
+    custom_prefix = "qtycustomset" if mode == "set" else "qtycustom"
     rows: list[dict] = [
         {
-            "id": f"qty:{item.id}:{quantity}",
+            "id": f"{prefix}:{item.id}:{quantity}",
             "title": f"{quantity} portion{'s' if quantity != 1 else ''}",
             "description": naira(item.price * quantity),
         }
@@ -1419,20 +1873,17 @@ async def show_quantity_selection(session: AsyncSession, user: User, item_id: in
     ]
     if available_quantity is None or available_quantity >= 5:
         rows.append({
-            "id": f"qtycustom:{item.id}",
+            "id": f"{custom_prefix}:{item.id}",
             "title": "5+ portions (Type quantity)",
         })
     rows.append({"id": "nav:back", "title": "⬅ Go back"})
-    rows.append({"id": "cancel", "title": "❌ Cancel order"})
 
     display_name = menu_service.friendly_item_name(item.name)
     item_label = f"*{display_name}*" if display_name == item.name else f"*{display_name}* (*{item.name}*)"
     cart_line = await _cart_status_line(session, user.id)
-    body = (
-        f"Step 3 of 6: How many portions?\n"
-        f"Item: {item_label} ({naira(item.price)} each)\n"
-        f"{cart_line}\n"
-        f"Select quantity below:"
+    body = _format_poll_header(
+        f"{_step_label(user.phone_number, 'quantity')} · Set quantity",
+        f"{item_label} ({naira(item.price)} each) · {cart_line}",
     )
     await whatsapp.send_list(
         user.phone_number,
@@ -1443,8 +1894,8 @@ async def show_quantity_selection(session: AsyncSession, user: User, item_id: in
     )
 
 
-async def prompt_custom_quantity(session: AsyncSession, user: User, item_id: int) -> None:
-    """Explicit free-text handoff when customer selects `5+ portions (Type quantity)` (Principle 5 & 8)."""
+async def prompt_custom_quantity(session: AsyncSession, user: User, item_id: int, *, mode: str = "set") -> None:
+    """Explicit free-text handoff when customer selects `5+ portions (Type quantity)`."""
     item: MenuItem | None = await menu_service.get_item(session, item_id)
     if item is None or not item.is_available:
         await whatsapp.send_text(user.phone_number, "Sorry, that item is no longer available. Send *menu* to pick something else.")
@@ -1452,19 +1903,47 @@ async def prompt_custom_quantity(session: AsyncSession, user: User, item_id: int
     available = item.sellable_units
     if available is not None and available < 5:
         await whatsapp.send_text(user.phone_number, f"Only {available} portion(s) of {menu_service.friendly_item_name(item.name)} left.")
-        return await show_quantity_selection(session, user, item_id)
+        return await show_quantity_selection(session, user, item_id, mode=mode)
 
     max_allowed = MAX_CUSTOM_QUANTITY if available is None else min(MAX_CUSTOM_QUANTITY, available)
-    _CUSTOM_QTY_ITEM[user.phone_number] = item.id
+    _CUSTOM_QTY_ITEM[user.phone_number] = (item.id, mode)
     display_name = menu_service.friendly_item_name(item.name)
     await whatsapp.send_text(
         user.phone_number,
         (
-            f"✍️ *TYPE QUANTITY BELOW (Step 3 of 6)*\n"
+            f"✍️ *TYPE QUANTITY BELOW ({_step_label(user.phone_number, 'quantity')})*\n"
             f"How many portions of *{display_name}* ({naira(item.price)} each) would you like?\n\n"
             f"👉 Type a number between *5* and *{max_allowed}* (for example: *6*)\n"
             f"_(Or reply *BACK* to go back, or *CANCEL* to cancel)_"
         ),
+    )
+
+
+async def handle_set_item_quantity(session: AsyncSession, user: User, item_id: int, quantity: int) -> None:
+    """Set exact quantity for `item_id` when updating via Change Quantity, then refresh Add-On Hub."""
+    item: MenuItem | None = await menu_service.get_item(session, item_id)
+    if item is None or not item.is_available:
+        await whatsapp.send_text(user.phone_number, "Sorry, that item just ran out. Send *menu* to pick something else.")
+        return
+    if quantity < 1 or quantity > MAX_CUSTOM_QUANTITY:
+        await whatsapp.send_text(user.phone_number, "Please choose a valid quantity.")
+        return
+    limit = item.sellable_units
+    if limit is not None and quantity > limit:
+        await whatsapp.send_buttons(
+            user.phone_number,
+            f"⚠️ Sorry, only {limit} {menu_service.friendly_item_name(item.name)} available.",
+            [("menu", "📂 Browse Full Menu"), ("checkout", "✅ Checkout"), ("nav:back", "⬅ Go back")],
+        )
+        return
+    cart = await order_service.get_or_create_cart(session, user.id)
+    await order_service.set_cart_item_quantity(session, user.id, item_id, quantity=quantity, cart_id=cart.id)
+    await send_addon_hub(
+        session,
+        user,
+        last_item=item,
+        added_qty=quantity,
+        hub_title=f"✅ Updated {menu_service.friendly_item_name(item.name)} to {quantity} portion{'s' if quantity != 1 else ''}",
     )
 
 
@@ -1486,36 +1965,11 @@ async def handle_add_item(
         await whatsapp.send_buttons(
             user.phone_number,
             f"⚠️ Sorry, only {limit} {menu_service.friendly_item_name(item.name)} available and you already have {in_cart} in your cart.",
-            [("menu", "🍛 Browse menu"), ("checkout", "✅ Checkout"), ("nav:back", "⬅ Go back"), ("cancel", "❌ Cancel order")],
+            [("menu", "📂 Browse Full Menu"), ("checkout", "✅ Checkout"), ("nav:back", "⬅ Go back")],
         )
         return
     await order_service.add_to_cart(session, user.id, item_id, quantity=quantity, cart_id=cart.id)
-    lines = await order_service.get_cart(session, cart.id)
-    subtotal = order_service.cart_subtotal(lines)
-    total_qty = sum(c.quantity for c, _ in lines)
-    display_name = menu_service.friendly_item_name(item.name)
-
-    # Principle 4: Sequential selection for add-ons + explicit "No extras" option
-    await whatsapp.send_buttons(
-        user.phone_number,
-        (
-            f"Step 4 of 6: Anything else with your order?\n"
-            f"✅ Added {quantity} x {display_name} ({naira(item.price * quantity)})\n"
-            f"🛒 Cart: {total_qty} item(s) · Subtotal: {naira(subtotal)}\n"
-            f"Choose an add-on or proceed to checkout:"
-        ),
-        [
-            ("checkout", f"🚫 No extras — Checkout ({naira(subtotal)})"),
-            ("cat:Protein 2", "🍗 Add Grilled Chicken"),
-            ("cat:Protein 3", "🦃 Add Grilled Turkey"),
-            ("cat:Protein 1", "🥩 Add Beef, Fish, Plantain or Extras"),
-            ("cat:Drinks", "🥤 Add a Cold Drink"),
-            ("menu", "🍛 Add another meal or snack"),
-            ("carts", "🛒 View / Edit cart"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
-        ],
-    )
+    await send_addon_hub(session, user, last_item=item, added_qty=quantity)
 
 
 async def handle_checkout(session: AsyncSession, user: User) -> None:
@@ -1564,7 +2018,6 @@ async def handle_checkout(session: AsyncSession, user: User) -> None:
         batch.fulfillment = Fulfillment(payment_batch_id=batch.id)
     batch.fulfillment.fulfillment_type = "delivery"
     batch.fulfillment.stage = FulfillmentStage.COLLECTING_DETAILS
-    batch.fulfillment.checkout_step = "choice"
     batch.fulfillment.timer_started_at = now
     batch.fulfillment.reminders_sent = "[]"
     kitchen_note = _KITCHEN_NOTES.pop(user.phone_number, None)
@@ -1573,20 +2026,62 @@ async def handle_checkout(session: AsyncSession, user: User) -> None:
     await session.flush()
 
     user.current_state = SessionState.COLLECTING_DETAILS
+    pre_area = _PRESELECTED_AREA.pop(user.phone_number, None)
+    saved, saved_area = await _active_saved_address(session, user.id)
+
+    # Pre-selected area from free-text ("... to Akute") takes priority if saved address is absent or different
+    if pre_area is not None and (saved_area is None or pre_area[0] != saved_area.id):
+        area = await session.get(DeliveryArea, pre_area[0])
+        if area is not None and area.is_active:
+            batch.fulfillment.fulfillment_type = "delivery"
+            batch.fulfillment.area_id = area.id
+            batch.fulfillment.area_name = area.name
+            batch.fulfillment.expected_minutes = area.expected_minutes
+            batch.fulfillment.checkout_step = "street"
+            _journey_update(user.phone_number, preselected_area=True, has_saved=False, fulfillment="delivery")
+            await whatsapp.send_text(
+                user.phone_number,
+                M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+            )
+            return
+
+    # 1-Tap Checkout Fast-Forward for Returning Customers with SavedAddress
+    if saved is not None and saved_area is not None:
+        batch.fulfillment.fulfillment_type = "delivery"
+        batch.fulfillment.street = saved.street
+        batch.fulfillment.area_id = saved_area.id
+        batch.fulfillment.area_name = saved_area.name
+        batch.fulfillment.landmark = saved.landmark
+        batch.fulfillment.phone2 = saved.phone2
+        batch.fulfillment.notes = _merge_kitchen_and_rider_notes(batch.fulfillment.notes, saved.notes)
+        batch.fulfillment.latitude = saved.latitude
+        batch.fulfillment.longitude = saved.longitude
+        batch.fulfillment.expected_minutes = saved_area.expected_minutes
+        batch.fulfillment.checkout_step = "summary"
+        _USED_SAVED_SUMMARY.add(user.phone_number)
+        _journey_update(user.phone_number, has_saved=True, preselected_area=False, fulfillment="delivery")
+        await send_summary(session, user, batch.fulfillment, batch=batch, using_saved_address=True)
+        return
+
+    # New Customer: 2-Step Checkout Page 1 (Select Area / Pickup / Other Area)
+    batch.fulfillment.checkout_step = "choice"
+    _journey_update(user.phone_number, has_saved=False, preselected_area=False, fulfillment=None)
     await _send_fulfillment_choice_poll(user, batch)
 
 
 async def _send_fulfillment_choice_poll(user: User, batch: PaymentBatch) -> None:
     total_qty, subtotal = _batch_totals(batch)
-    cart_line = f"🛒 Order subtotal: {naira(subtotal)} ({total_qty} item{'s' if total_qty != 1 else ''})"
+    pack_fee = getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")
+    base_total = subtotal + pack_fee
+    cart_line = f"🛒 Order: {total_qty} item{'s' if total_qty != 1 else ''} · {naira(base_total)}"
     await whatsapp.send_buttons(
         user.phone_number,
-        M1_CHOICE.format(cart_line=cart_line),
+        M1_CHOICE.format(step_label=_step_label(user.phone_number, "choice"), cart_line=cart_line),
         [
-            ("fulfillment:delivery", "🛵 Delivery to my address"),
-            ("fulfillment:pickup", "🏪 Pickup at Tofex Outlet (₦0 fee)"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
+            ("fulfillment:delivery", "📍 Select Delivery Area"),
+            ("fulfillment:pickup", f"🏃 Pickup at {settings.outlet_address} (₦0 Fee)"),
+            ("area:other", "✍️ Add Other Area (Custom quote)"),
+            ("nav:back", "⬅ Back to Cart"),
         ],
     )
 
@@ -1613,7 +2108,9 @@ async def show_carts(session: AsyncSession, user: User) -> None:
     _push_nav(user.phone_number, {"kind": "carts"})
     active_cart = await order_service.get_or_create_cart(session, user.id)
     active_lines = await order_service.get_cart(session, active_cart.id)
-    total_qty, total_sub = await order_service.get_user_cart_summary(session, user.id)
+    total_qty, total_sub, pack_fee = await order_service.get_user_cart_totals(session, user.id)
+    cart_total = total_sub + pack_fee
+    step_lbl = _step_label(user.phone_number, "carts")
 
     # Send itemized cart summary text if the active cart has items
     if active_lines:
@@ -1621,9 +2118,14 @@ async def show_carts(session: AsyncSession, user: User) -> None:
             f"• {c.quantity} x {menu_service.friendly_item_name(m.name)} — {naira(m.price * c.quantity)}"
             for c, m in active_lines
         )
+        pack_line = _pack_summary_line(pack_fee)
         await whatsapp.send_text(
             user.phone_number,
-            f"🛒 *YOUR CART (Step 4 of 6)*\n{item_bullets}\n━━━━━━━━━━━━━━━━━━\n*Subtotal:* {naira(total_sub)}",
+            (
+                f"🛒 *YOUR CART ({step_lbl})*\n{item_bullets}\n"
+                f"• Items subtotal: {naira(total_sub)}\n{pack_line}"
+                f"━━━━━━━━━━━━━━━━━━\n*Total:* {naira(cart_total)}"
+            ),
         )
 
     rows: list[dict] = []
@@ -1631,7 +2133,7 @@ async def show_carts(session: AsyncSession, user: User) -> None:
         rows.append({
             "id": "checkout",
             "title": "✅ Proceed to checkout",
-            "description": f"{total_qty} item(s), {naira(total_sub)}",
+            "description": f"{total_qty} item(s), {naira(cart_total)}",
         })
     rows.append({"id": "menu", "title": "➕ Add more items"})
 
@@ -1642,34 +2144,39 @@ async def show_carts(session: AsyncSession, user: User) -> None:
             "description": f"Remove {c_item.quantity}x ({naira(m_item.price * c_item.quantity)})",
         })
 
-    for cart in carts:
-        lines = await order_service.get_cart(session, cart.id)
-        subtotal = order_service.cart_subtotal(lines)
-        marker = "✓ " if cart.is_selected else ""
-        rows.append({
-            "id": f"cart:{cart.id}",
-            "title": f"{marker}{cart.name}"[:24],
-            "description": f"{sum(c.quantity for c, _ in lines)} item(s), {naira(subtotal)}",
-        })
+    if len(carts) > 1:
+        for cart in carts:
+            lines = await order_service.get_cart(session, cart.id)
+            subtotal = order_service.cart_subtotal(lines)
+            marker = "✓ " if cart.is_selected else ""
+            rows.append({
+                "id": f"cart:{cart.id}",
+                "title": f"{marker}{cart.name}"[:24],
+                "description": f"{sum(c.quantity for c, _ in lines)} item(s), {naira(subtotal)}",
+            })
 
     if total_qty > 0:
         rows.append({"id": "clearcart", "title": "🗑️ Clear cart"})
     rows.append({"id": "newcart", "title": "🛍️ New cart (Separate pack)"})
+    rows.append({"id": "staff:escalate", "title": "💬 Talk to staff"})
     rows.append({"id": "nav:back", "title": "⬅ Go back"})
-    rows.append({"id": "cancel", "title": "❌ Cancel order"})
+
+    max_rows = 12 if (whatsapp.is_evolution_provider() or settings.dry_run) else 10
+    if len(rows) > max_rows:
+        # Preserve trailing Clear / Staff / Go back when slicing
+        tail = rows[-3:]
+        rows = rows[: max_rows - 3] + tail
 
     user.current_state = SessionState.SELECTING_CARTS
-    # Single poll (Principle 1: never send two polls back-to-back in one turn)
     await whatsapp.send_list(
         user.phone_number,
-        (
-            f"Step 4 of 6: Review or edit your cart\n"
-            f"🛒 {total_qty} item(s) · Subtotal: {naira(total_sub)}\n"
-            f"Tap Checkout when ready, or edit your cart below:"
+        _format_poll_header(
+            f"{step_lbl} · Review or edit cart",
+            f"🛒 {total_qty} item(s) · Total: {naira(cart_total)} · Tap Checkout when ready:",
         ),
         "Manage cart",
         "Your carts",
-        rows[:12],
+        rows,
     )
 
 
@@ -1714,6 +2221,7 @@ async def cancel_checkout(session: AsyncSession, user: User, batch: PaymentBatch
     batch.status = OrderStatus.CANCELLED
     for order in batch.orders:
         order.status = OrderStatus.CANCELLED
+    _clear_user_ephemeral_state(user.phone_number)
     user.current_state = SessionState.BROWSING
     await whatsapp.send_text(
         user.phone_number, f"Order #{batch.id} has been cancelled. Send *menu* whenever you'd like to start again."
@@ -1721,7 +2229,7 @@ async def cancel_checkout(session: AsyncSession, user: User, batch: PaymentBatch
 
 
 async def return_checkout_to_cart(session: AsyncSession, user: User, batch: PaymentBatch, fulfillment: Fulfillment) -> None:
-    """Restore items from an unconfirmed checkout batch back into the cart and open Step 4 cart view."""
+    """Restore items from an unconfirmed checkout batch back into the cart and open cart view."""
     kitchen_prefix = _extract_kitchen_prefix(fulfillment.notes)
     if kitchen_prefix:
         _KITCHEN_NOTES[user.phone_number] = kitchen_prefix.removeprefix("Kitchen: ").strip()
@@ -1734,6 +2242,7 @@ async def return_checkout_to_cart(session: AsyncSession, user: User, batch: Paym
     batch.status = OrderStatus.CANCELLED
     for order in batch.orders:
         order.status = OrderStatus.CANCELLED
+    _USED_SAVED_SUMMARY.discard(user.phone_number)
     user.current_state = SessionState.SELECTING_CARTS
     await show_carts(session, user)
 
@@ -1787,7 +2296,7 @@ async def handle_checkout_flow(
         await process_address_step(session, user, fulfillment, batch, msg)
         return
 
-    if rid == "checkout:edit_items" and stage in (FulfillmentStage.COLLECTING_DETAILS, FulfillmentStage.AWAITING_FEE_ACCEPT):
+    if rid in {"checkout:edit_items", "cart:view"} and stage in (FulfillmentStage.COLLECTING_DETAILS, FulfillmentStage.AWAITING_FEE_ACCEPT):
         await return_checkout_to_cart(session, user, batch, fulfillment)
         return
 
@@ -2003,7 +2512,7 @@ def _parse_combined_address(raw: str) -> tuple[str, str] | None:
 
 
 async def _send_extras_menu(user: User, fulfillment: Fulfillment) -> None:
-    """Send the optional delivery details picker from the Step 6 Summary screen."""
+    """Send the optional delivery details picker from the Summary screen."""
     status_parts: list[str] = []
     if fulfillment.latitude is not None and fulfillment.longitude is not None:
         status_parts.append("📌 GPS Pin: Added")
@@ -2016,10 +2525,9 @@ async def _send_extras_menu(user: User, fulfillment: Fulfillment) -> None:
 
     await whatsapp.send_buttons(
         user.phone_number,
-        (
-            f"Step 6 of 6: Optional delivery details\n"
-            f"{status_line}\n"
-            f"Select an optional detail to add or return to your summary:"
+        _format_poll_header(
+            f"{_step_label(user.phone_number, 'extras')} · Optional delivery details",
+            status_line,
         ),
         [
             ("extras:done", "✅ Done — Back to Order Summary"),
@@ -2027,7 +2535,6 @@ async def _send_extras_menu(user: User, fulfillment: Fulfillment) -> None:
             ("extras:phone2", "📞 Add backup phone number"),
             ("extras:notes", "📝 Add delivery / gate note"),
             ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
         ],
     )
 
@@ -2070,31 +2577,41 @@ async def _handle_checkout_go_back(
             await _send_extras_menu(user, fulfillment)
         else:
             fulfillment.checkout_step = "street"
-            await whatsapp.send_text(user.phone_number, M2_STREET)
+            await whatsapp.send_text(
+                user.phone_number,
+                M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+            )
         return
     if step == "landmark":
         fulfillment.checkout_step = "street"
-        await whatsapp.send_text(user.phone_number, M2_STREET)
+        await whatsapp.send_text(
+            user.phone_number,
+            M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+        )
         return
     if step == "summary":
-        if fulfillment.fulfillment_type == "pickup":
+        if user.phone_number in _USED_SAVED_SUMMARY:
+            await return_checkout_to_cart(session, user, batch, fulfillment)
+        elif fulfillment.fulfillment_type == "pickup":
             fulfillment.checkout_step = "choice"
             await _send_fulfillment_choice_poll(user, batch)
         else:
             fulfillment.checkout_step = "street"
-            await whatsapp.send_text(user.phone_number, M2_STREET)
+            await whatsapp.send_text(
+                user.phone_number,
+                M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+            )
         return
 
 
 async def _send_phone2_prompt(user: User) -> None:
     await whatsapp.send_buttons(
         user.phone_number,
-        M6_SECOND_PHONE,
+        M6_SECOND_PHONE.format(step_label=_step_label(user.phone_number, "phone2")),
         [
             ("address:skip_phone", "⏭️ Skip backup phone"),
             ("address:fast_summary", "⚡ Back to Order Summary"),
             ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
         ],
     )
 
@@ -2102,11 +2619,10 @@ async def _send_phone2_prompt(user: User) -> None:
 async def _send_notes_prompt(user: User) -> None:
     await whatsapp.send_buttons(
         user.phone_number,
-        M7_NOTES,
+        M7_NOTES.format(step_label=_step_label(user.phone_number, "notes")),
         [
             ("address:skip_notes", "🚫 No extra notes — Review order"),
             ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
         ],
     )
 
@@ -2125,19 +2641,44 @@ async def process_address_step(
         return
 
     if step == "choice":
-        if rid == "fulfillment:pickup":
+        if rid in {"fulfillment:pickup", "fulfill:pickup"}:
             fulfillment.fulfillment_type = "pickup"
             fulfillment.checkout_step = "summary"
-            await send_summary(session, user, fulfillment, batch=batch)
-        elif rid == "fulfillment:delivery":
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
+            _journey_update(user.phone_number, fulfillment="pickup")
+            await send_summary(session, user, fulfillment, batch=batch, using_saved_address=False)
+        elif rid in {"fulfillment:delivery", "fulfill:delivery"}:
             fulfillment.fulfillment_type = "delivery"
-            saved, area = await _active_saved_address(session, user.id)
-            if saved is not None and area is not None:
-                fulfillment.checkout_step = "saved_choice"
-                await _send_saved_address_prompt(user, saved, area, batch=batch)
+            fulfillment.checkout_step = "area"
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
+            _journey_update(user.phone_number, fulfillment="delivery")
+            await send_area_page(session, user, fulfillment, 0, batch=batch)
+        elif rid == "area:other":
+            fulfillment.fulfillment_type = "delivery"
+            fulfillment.checkout_step = "other_area"
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
+            _journey_update(user.phone_number, fulfillment="other_area")
+            await whatsapp.send_text(
+                user.phone_number,
+                M3B_OTHER_AREA.format(step_label=_step_label(user.phone_number, "other_area")),
+            )
+        elif rid.startswith("area:"):
+            # Also accept direct area:{id} from Page 1 if sent
+            area_id_str = rid.split(":", 1)[1]
+            area = await session.get(DeliveryArea, int(area_id_str)) if area_id_str.isdecimal() else None
+            if area is not None and area.is_active:
+                fulfillment.fulfillment_type = "delivery"
+                fulfillment.area_id = area.id
+                fulfillment.area_name = area.name
+                fulfillment.expected_minutes = area.expected_minutes
+                fulfillment.checkout_step = "street"
+                _journey_update(user.phone_number, fulfillment="delivery")
+                await whatsapp.send_text(
+                    user.phone_number,
+                    M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+                )
             else:
-                fulfillment.checkout_step = "area"
-                await send_area_page(session, user, fulfillment, 0, batch=batch)
+                await _send_fulfillment_choice_poll(user, batch)
         else:
             await _send_fulfillment_choice_poll(user, batch)
         return
@@ -2168,14 +2709,18 @@ async def process_address_step(
         return
 
     if step == "area":
-        if rid.startswith("areas:"):
+        if rid.startswith("areas:") or rid.startswith("areapg:"):
             page_str = rid.split(":", 1)[1]
             page = int(page_str) if page_str.isdecimal() else 0
             await send_area_page(session, user, fulfillment, page, batch=batch)
             return
         if rid == "area:other":
             fulfillment.checkout_step = "other_area"
-            await whatsapp.send_text(user.phone_number, M3B_OTHER_AREA)
+            _journey_update(user.phone_number, fulfillment="other_area")
+            await whatsapp.send_text(
+                user.phone_number,
+                M3B_OTHER_AREA.format(step_label=_step_label(user.phone_number, "other_area")),
+            )
             return
         if rid.startswith("area:"):
             area_id_str = rid.split(":", 1)[1]
@@ -2191,7 +2736,11 @@ async def process_address_step(
             fulfillment.area_name = area.name
             fulfillment.expected_minutes = area.expected_minutes
             fulfillment.checkout_step = "street"
-            await whatsapp.send_text(user.phone_number, M2_STREET)
+            _journey_update(user.phone_number, fulfillment="delivery")
+            await whatsapp.send_text(
+                user.phone_number,
+                M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+            )
             return
         await send_area_page(session, user, fulfillment, 0, batch=batch)
         return
@@ -2206,7 +2755,11 @@ async def process_address_step(
         fulfillment.area_id = None
         fulfillment.area_name = text
         fulfillment.checkout_step = "street"
-        await whatsapp.send_text(user.phone_number, M2_STREET)
+        _journey_update(user.phone_number, fulfillment="delivery")
+        await whatsapp.send_text(
+            user.phone_number,
+            M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+        )
         return
 
     if step == "street":
@@ -2217,10 +2770,11 @@ async def process_address_step(
                 fulfillment.checkout_step = "summary"
                 await send_summary(session, user, fulfillment, batch=batch)
             else:
+                step_lbl = _step_label(user.phone_number, "street")
                 await whatsapp.send_text(
                     user.phone_number,
                     (
-                        "📍 *GPS Location Pin saved! (Step 5 of 6)*\n"
+                        f"📍 *GPS Location Pin saved! ({step_lbl})*\n"
                         "Now please type your *house/gate number, street name, and nearest landmark* in one message so our rider knows your exact door.\n"
                         "👉 Example: *14 Denro Road, yellow gate opposite St. Leo Church*\n\n"
                         "_(Or reply *BACK* to change your area, or *CANCEL* to cancel)_"
@@ -2308,12 +2862,14 @@ async def process_address_step(
         except ValueError:
             await whatsapp.send_buttons(
                 user.phone_number,
-                "⚠️ That phone number doesn't look valid (e.g. *08031234567*). Please try again or tap Skip below:",
+                _format_poll_header(
+                    f"{_step_label(user.phone_number, 'phone2')} · Invalid phone number",
+                    "⚠️ Enter a number like *08031234567*, or tap Skip:",
+                ),
                 [
                     ("address:skip_phone", "⏭️ Skip backup phone"),
                     ("address:fast_summary", "⚡ Back to Order Summary"),
                     ("nav:back", "⬅ Go back"),
-                    ("cancel", "❌ Cancel order"),
                 ],
             )
             return
@@ -2335,9 +2891,38 @@ async def process_address_step(
             fulfillment.longitude = msg.longitude
             await send_summary(session, user, fulfillment, batch=batch)
             return
-        if rid == "address:extras":
+        if rid in {"address:extras", "checkout:extras"}:
             fulfillment.checkout_step = "extras"
             await _send_extras_menu(user, fulfillment)
+            return
+        if rid == "checkout:switch_pickup":
+            fulfillment.fulfillment_type = "pickup"
+            fulfillment.street = None
+            fulfillment.area_id = None
+            fulfillment.area_name = None
+            fulfillment.landmark = None
+            fulfillment.latitude = None
+            fulfillment.longitude = None
+            fulfillment.expected_minutes = None
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
+            _journey_update(user.phone_number, fulfillment="pickup")
+            await send_summary(session, user, fulfillment, batch=batch, using_saved_address=False)
+            return
+        if rid == "checkout:new_address":
+            fulfillment.fulfillment_type = "delivery"
+            fulfillment.street = None
+            fulfillment.area_id = None
+            fulfillment.area_name = None
+            fulfillment.landmark = None
+            fulfillment.phone2 = None
+            fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
+            fulfillment.latitude = None
+            fulfillment.longitude = None
+            fulfillment.expected_minutes = None
+            fulfillment.checkout_step = "area"
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
+            _journey_update(user.phone_number, has_saved=False, preselected_area=False, fulfillment="delivery")
+            await send_area_page(session, user, fulfillment, 0, batch=batch)
             return
         if rid == "address:edit":
             if fulfillment.fulfillment_type == "pickup":
@@ -2348,9 +2933,13 @@ async def process_address_step(
             fulfillment.landmark = None
             fulfillment.phone2 = None
             fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
+            _USED_SAVED_SUMMARY.discard(user.phone_number)
             if fulfillment.address_editing:  # after checkout the area is locked, so restart at the street
                 fulfillment.checkout_step = "street"
-                await whatsapp.send_text(user.phone_number, M2_STREET)
+                await whatsapp.send_text(
+                    user.phone_number,
+                    M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+                )
             else:  # still checking out: start over from the area so a wrong area can be corrected
                 fulfillment.area_id = None
                 fulfillment.area_name = None
@@ -2358,7 +2947,7 @@ async def process_address_step(
                 fulfillment.longitude = None
                 fulfillment.checkout_step = "area"
                 await send_area_page(session, user, fulfillment, 0, batch=batch)
-        elif rid == "address:confirm":
+        elif rid in {"address:confirm", "checkout:confirm_saved"}:
             await confirm_address(session, user, fulfillment)
         else:
             await send_summary(session, user, fulfillment, batch=batch)
@@ -2381,19 +2970,25 @@ async def begin_address(session: AsyncSession, user: User, fulfillment: Fulfillm
         fulfillment.notes = _extract_kitchen_prefix(fulfillment.notes)
     fulfillment.checkout_step = "street"
     user.current_state = SessionState.COLLECTING_DETAILS
-    await whatsapp.send_text(user.phone_number, M2_STREET)
+    await whatsapp.send_text(
+        user.phone_number,
+        M2_STREET.format(step_label=_step_label(user.phone_number, "street")),
+    )
 
 
 async def ask_pin(session: AsyncSession, user: User) -> None:
-    """Send a location request and skip/back/cancel poll for the customer."""
-    await whatsapp.send_location_request(user.phone_number, M4_PIN)
+    """Send a location request and skip/back poll for the customer."""
+    step_lbl = _step_label(user.phone_number, "pin")
+    await whatsapp.send_location_request(user.phone_number, M4_PIN.format(step_label=step_lbl))
     await whatsapp.send_buttons(
         user.phone_number,
-        "Step 6 of 6: Share location pin or skip\nTap an option below if you'd like to skip sharing your GPS pin:",
+        _format_poll_header(
+            f"{step_lbl} · Share GPS location pin or skip",
+            "Tap below to skip sharing your GPS pin:",
+        ),
         [
             ("address:skip_pin", "⏭️ Skip location pin"),
             ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
         ],
     )
 
@@ -2401,7 +2996,7 @@ async def ask_pin(session: AsyncSession, user: User) -> None:
 async def send_area_page(
     session: AsyncSession, user: User, fulfillment: Fulfillment, page: int, *, batch: PaymentBatch | None = None
 ) -> None:
-    """Send a paginated poll of active delivery areas with fees, ETA, and escape routes."""
+    """Send a paginated poll of 5 active delivery areas with fees, ETA, More/Previous, Other area, and Go back."""
     areas = list((await session.execute(
         select(DeliveryArea).where(DeliveryArea.is_active.is_(True)).order_by(DeliveryArea.sort_order, DeliveryArea.name)
     )).scalars())
@@ -2418,51 +3013,73 @@ async def send_area_page(
         rows.append({"id": f"areas:{page - 1}", "title": "⬅ Previous areas"})
     rows.append({"id": "area:other", "title": "Other area"})
     rows.append({"id": "nav:back", "title": "⬅ Go back"})
-    rows.append({"id": "cancel", "title": "❌ Cancel order"})
 
     if batch is None:
         batch = await order_service.get_batch(session, fulfillment.payment_batch_id)
     subtotal = _batch_totals(batch)[1] if batch is not None else Decimal("0")
-    cart_line = f"🛒 Items subtotal: {naira(subtotal)}"
-    await whatsapp.send_list(user.phone_number, M3_AREA.format(cart_line=cart_line), "Choose area", "Delivery areas", rows)
+    pack_fee = getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")
+    cart_line = f"🛒 Order subtotal: {naira(subtotal + pack_fee)}"
+    await whatsapp.send_list(
+        user.phone_number,
+        M3_AREA.format(step_label=_step_label(user.phone_number, "area"), cart_line=cart_line),
+        "Choose area",
+        "Delivery areas",
+        rows,
+    )
 
 
 async def send_summary(
-    session: AsyncSession, user: User, fulfillment: Fulfillment, *, batch: PaymentBatch | None = None
+    session: AsyncSession,
+    user: User,
+    fulfillment: Fulfillment,
+    *,
+    batch: PaymentBatch | None = None,
+    using_saved_address: bool | None = None,
 ) -> None:
-    """Send the full itemized order summary message followed by the Step 6 confirmation poll (Principle 7)."""
+    """Send the full itemized order summary message followed by the dynamic Summary Action Poll."""
     if batch is None:
         batch = await order_service.get_batch(session, fulfillment.payment_batch_id)
     if batch is None:
         return
     subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
+    pack_fee = getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")
+    base_total = subtotal + pack_fee
+    packaging_line = _pack_summary_line(pack_fee)
     items_block = _batch_items_block(batch)
+    step_lbl = _step_label(user.phone_number, "summary")
+    is_saved_mode = (
+        using_saved_address
+        if using_saved_address is not None
+        else (user.phone_number in _USED_SAVED_SUMMARY and fulfillment.fulfillment_type == "delivery")
+    )
 
     if fulfillment.fulfillment_type == "pickup":
-        total_text = naira(subtotal)
+        total_text = naira(base_total)
         pickup_items = f"{items_block}\n📝 Notes: {fulfillment.notes}" if fulfillment.notes else items_block
         summary_text = M8_PICKUP_SUMMARY.format(
+            step_label=step_lbl,
             items_block=pickup_items,
             outlet_address=settings.outlet_address,
             subtotal=naira(subtotal),
+            packaging_line=packaging_line,
             total=total_text,
         )
         confirm_buttons = [
             ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
             ("address:edit", "📍 Edit delivery / pickup"),
-            ("checkout:edit_items", "🛒 Edit items in cart"),
+            ("checkout:edit_items", "🛒 Edit Cart"),
             ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
         ]
     else:
         area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
         if area is not None:
-            fee_text, total_text = naira(area.fee), naira(subtotal + area.fee)
+            fee_text, total_text = naira(area.fee), naira(base_total + area.fee)
         else:  # "Other area": staff will quote the fee after the customer confirms
-            fee_text, total_text = "to be confirmed", f"{naira(subtotal)} + delivery fee"
+            fee_text, total_text = "to be confirmed", f"{naira(base_total)} + delivery fee"
         pin_line = "📌 GPS Pin: Shared ✅\n" if fulfillment.latitude is not None and fulfillment.longitude is not None else ""
         phone_line = f"📞 Second phone: {fulfillment.phone2}\n" if fulfillment.phone2 else ""
         summary_text = M8_SUMMARY.format(
+            step_label=step_lbl,
             items_block=items_block,
             street=fulfillment.street or "",
             area=fulfillment.area_name or "",
@@ -2470,22 +3087,33 @@ async def send_summary(
             second_phone_line=f"{pin_line}{phone_line}",
             notes_line=f"📝 Notes: {fulfillment.notes}\n" if fulfillment.notes else "",
             subtotal=naira(subtotal),
+            packaging_line=packaging_line,
             fee=fee_text,
             total=total_text,
         )
-        confirm_buttons = [
-            ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
-            ("address:extras", "➕ Add Pin / Phone / Note"),
-            ("address:edit", "📍 Edit delivery / pickup"),
-            ("checkout:edit_items", "🛒 Edit items in cart"),
-            ("nav:back", "⬅ Go back"),
-            ("cancel", "❌ Cancel order"),
-        ]
+        if is_saved_mode and area is not None:
+            short_addr = f"{(fulfillment.street or '')[:18]}, {(fulfillment.area_name or '')[:14]}".strip(" ,")
+            confirm_buttons = [
+                ("address:confirm", f"✅ Confirm & Pay {total_text} ({short_addr})"[:96]),
+                ("checkout:switch_pickup", f"🏃 Switch to Pickup (Pay {naira(base_total)} · Save {naira(area.fee)})"[:96]),
+                ("checkout:new_address", "📍 Deliver to a Different Address"),
+                ("address:extras", "📝 Add Pin / Phone / Note"),
+                ("checkout:edit_items", "🛒 Edit Cart"),
+                ("nav:back", "⬅ Go back"),
+            ]
+        else:
+            confirm_buttons = [
+                ("address:confirm", f"✅ Confirm & Pay ({total_text})"[:48]),
+                ("address:extras", "➕ Add Pin / Phone / Note"),
+                ("address:edit", "📍 Edit delivery / pickup"),
+                ("checkout:edit_items", "🛒 Edit Cart"),
+                ("nav:back", "⬅ Go back"),
+            ]
 
     await whatsapp.send_text(user.phone_number, summary_text)
     await whatsapp.send_buttons(
         user.phone_number,
-        M8_CONFIRM_POLL.format(total=total_text),
+        M8_CONFIRM_POLL.format(step_label=step_lbl, total=total_text)[:255],
         confirm_buttons,
     )
 
@@ -2498,6 +3126,7 @@ async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfil
     if batch is None:
         return
     now = datetime.now(timezone.utc)
+    _USED_SAVED_SUMMARY.discard(user.phone_number)
 
     if fulfillment.address_editing:  # a change after checkout: the order stays exactly where it was
         fulfillment.address_editing = False
@@ -2512,9 +3141,12 @@ async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfil
         return
 
     subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
+    pack_fee = getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")
+    base_total = subtotal + pack_fee
+
     if fulfillment.fulfillment_type == "pickup":
         batch.delivery_fee = Decimal("0")
-        batch.total_amount = subtotal
+        batch.total_amount = base_total
         fulfillment.stage = FulfillmentStage.AWAITING_PAYMENT
         fulfillment.timer_started_at = now
         fulfillment.reminders_sent = "[]"
@@ -2527,7 +3159,7 @@ async def confirm_address(session: AsyncSession, user: User, fulfillment: Fulfil
     area = await session.get(DeliveryArea, fulfillment.area_id) if fulfillment.area_id else None
     if area:
         batch.delivery_fee = area.fee
-        batch.total_amount = subtotal + area.fee
+        batch.total_amount = base_total + area.fee
         fulfillment.expected_minutes = area.expected_minutes
         fulfillment.stage = FulfillmentStage.AWAITING_PAYMENT
         fulfillment.timer_started_at = now

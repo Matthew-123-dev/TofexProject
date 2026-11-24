@@ -67,7 +67,7 @@ async def test_parser_multi_item_slang_naira_and_special_requests(db):
 
 @pytest.mark.asyncio
 async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
-    """Verify Step 1 `✍️ Type your order`, confirmation, kitchen notes on Fulfillment, and stripping from Rider/SavedAddress."""
+    """Verify inline free-text fast-forward, packaging fee, kitchen notes on Fulfillment, and stripping from Rider/SavedAddress."""
     await seed.main()
     area = DeliveryArea(name="Akute", fee=Decimal("700.00"), expected_minutes=30, is_active=True, sort_order=1)
     rider = Rider(
@@ -80,22 +80,14 @@ async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
     db.add_all([area, rider])
     await db.commit()
 
-    # Step 1: Menu shows `✍️ Type your order`
+    # Step 1: Greeting explains free-text ordering inline
     await state_machine.handle_incoming(
         db, IncomingMessage(id="to-1", sender=user.phone_number, type="text", text="menu")
     )
-    step1_rows = whatsapp.send_list.call_args[0][4]
-    assert any(r["id"] == "typeorder:start" and r["title"] == "✍️ Type your order" for r in step1_rows)
+    step1_body = whatsapp.send_list.call_args[0][1]
+    assert "type your order" in step1_body.lower()
 
-    # Customer taps `✍️ Type your order`
-    whatsapp.send_text.reset_mock()
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-2", sender=user.phone_number, type="interactive", reply_id="typeorder:start")
-    )
-    assert whatsapp.send_text.called
-    assert "TYPE YOUR ORDER BELOW (Step 2 of 6)" in whatsapp.send_text.call_args[0][1]
-
-    # Customer sends typed order with Jollof Rice ("add stew") and Large Shawarma ("less pepper no sausage")
+    # Customer types a high-confidence free-text order directly -> skips "Add all to cart" & goes straight to Cart Summary
     whatsapp.send_text.reset_mock()
     whatsapp.send_buttons.reset_mock()
     await state_machine.handle_incoming(
@@ -109,10 +101,12 @@ async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
     )
     assert whatsapp.send_text.called
     summary_msg = whatsapp.send_text.call_args[0][1]
-    assert "WE UNDERSTOOD YOUR ORDER (Step 3 of 6)" in summary_msg
+    assert "ADDED TO YOUR CART" in summary_msg
     assert "2 x Jollof rice — ₦800" in summary_msg
     assert "1 x Shawarma (Large) — ₦2,000" in summary_msg
     assert "1 x Coke — ₦500" in summary_msg
+    assert "Takeaway pack (Small): ₦200" in summary_msg
+    assert "Cart Total:* ₦3,500" in summary_msg
     assert "📝 *Kitchen note:*" in summary_msg
     assert "add stew" in summary_msg
     assert "less pepper" in summary_msg
@@ -120,16 +114,7 @@ async def test_typed_order_direct_flow_and_kitchen_notes_separation(db, user):
 
     assert whatsapp.send_buttons.called
     confirm_buttons = whatsapp.send_buttons.call_args[0][2]
-    assert confirm_buttons[0] == ("typeorder:confirm", "✅ Add all to cart (₦3,300)")
-
-    # Customer confirms typed order -> moves to Step 4 of 6 add-ons / checkout poll
-    whatsapp.send_buttons.reset_mock()
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="to-4", sender=user.phone_number, type="interactive", reply_id="typeorder:confirm")
-    )
-    step4_body = whatsapp.send_buttons.call_args[0][1]
-    assert "Step 4 of 6" in step4_body
-    assert "₦3,300" in step4_body
+    assert confirm_buttons[0] == ("checkout", "✅ Confirm & Checkout (₦3,500)")
 
     # Proceed to checkout -> Delivery -> Area -> Combined Street & Landmark -> Optional Rider Note via address:extras -> Confirm
     await state_machine.handle_incoming(
@@ -207,7 +192,7 @@ async def test_typed_order_max_two_followup_polls_and_go_back(db, user):
     # Follow-up 1 of 2: Chicken size
     assert whatsapp.send_buttons.called
     q1_body, q1_buttons = whatsapp.send_buttons.call_args[0][1], whatsapp.send_buttons.call_args[0][2]
-    assert "Step 2 of 6: Quick check 1 of 2" in q1_body
+    assert "Quick check 1 of 2" in q1_body
     assert "Grilled Chicken" in q1_body
     assert len(q1_body) <= 255
     assert 2 <= len(q1_buttons) <= 12
@@ -222,7 +207,7 @@ async def test_typed_order_max_two_followup_polls_and_go_back(db, user):
 
     # Follow-up 2 of 2: Turkey size
     q2_body, q2_buttons = whatsapp.send_buttons.call_args[0][1], whatsapp.send_buttons.call_args[0][2]
-    assert "Step 2 of 6: Quick check 2 of 2" in q2_body
+    assert "Quick check 2 of 2" in q2_body
     assert "Grilled Turkey" in q2_body
 
     # Test `⬅ Go back` from Follow-up 2 -> returns to Follow-up 1 and undoes the first chicken selection
@@ -230,7 +215,7 @@ async def test_typed_order_max_two_followup_polls_and_go_back(db, user):
     await state_machine.handle_incoming(
         db, IncomingMessage(id="fu-back", sender=user.phone_number, type="interactive", reply_id="nav:back")
     )
-    assert "Step 2 of 6: Quick check 1 of 2" in whatsapp.send_buttons.call_args[0][1]
+    assert "Quick check 1 of 2" in whatsapp.send_buttons.call_args[0][1]
 
     # Pick second chicken option this time, then skip turkey on Follow-up 2
     second_chicken_id = q1_buttons[1][0]
@@ -246,7 +231,7 @@ async def test_typed_order_max_two_followup_polls_and_go_back(db, user):
     # Now on Confirmation screen (no 3rd or 4th follow-up poll!): `fish` and `shawarma` are in `⚠️ Please specify`
     assert whatsapp.send_text.called
     summary_text = whatsapp.send_text.call_args[0][1]
-    assert "WE UNDERSTOOD YOUR ORDER (Step 3 of 6)" in summary_text
+    assert "WE UNDERSTOOD YOUR ORDER" in summary_text
     assert "1 x Jollof rice" in summary_text
     assert "2 x Chicken Medium (2)" in summary_text
     assert "Chicken Small (1)" not in summary_text  # undone by `⬅ Go back`!
@@ -257,30 +242,27 @@ async def test_typed_order_max_two_followup_polls_and_go_back(db, user):
 
 @pytest.mark.asyncio
 async def test_typed_order_non_empty_cart_add_or_replace(db, user):
-    """Verify non-empty cart prompts `➕ Add to my cart` vs `🔄 Replace my cart`."""
+    """Verify non-empty cart auto-appends high-confidence typed orders and offers 1-tap `🔄 Replace previous cart instead`."""
     await seed.main()
     fried_rice = (await db.execute(select(MenuItem).where(MenuItem.name == "Fried rice"))).scalar_one()
     await order_service.add_to_cart(db, user.id, fried_rice.id, quantity=1)
     await db.commit()
 
-    # Customer types a new order while cart already has 1 x Fried rice
+    # Customer types a new high-confidence order while cart already has 1 x Fried rice
     whatsapp.send_buttons.reset_mock()
     await state_machine.handle_incoming(
         db, IncomingMessage(id="cm-1", sender=user.phone_number, type="text", text="2 beef, 1 plantain")
     )
     assert whatsapp.send_buttons.called
     mode_body, mode_buttons = whatsapp.send_buttons.call_args[0][1], whatsapp.send_buttons.call_args[0][2]
-    assert "already have 1 item" in mode_body
+    assert "1,800" in mode_body  # 400 + 1000 + 200 + 200 pack
     mode_ids = [b[0] for b in mode_buttons]
-    assert "typeorder:mode:add" in mode_ids
-    assert "typeorder:mode:replace" in mode_ids
+    assert mode_ids[0] == "checkout"
+    assert "typeorder:replace_prev" in mode_ids
 
-    # Choose `🔄 Replace my cart` -> shows confirmation -> confirm
+    # Choose `🔄 Replace previous cart instead` -> keeps ONLY 2 beef + 1 plantain
     await state_machine.handle_incoming(
-        db, IncomingMessage(id="cm-2", sender=user.phone_number, type="interactive", reply_id="typeorder:mode:replace")
-    )
-    await state_machine.handle_incoming(
-        db, IncomingMessage(id="cm-3", sender=user.phone_number, type="interactive", reply_id="typeorder:confirm")
+        db, IncomingMessage(id="cm-2", sender=user.phone_number, type="interactive", reply_id="typeorder:replace_prev")
     )
 
     cart = await order_service.get_or_create_cart(db, user.id)

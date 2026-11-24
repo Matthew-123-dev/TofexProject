@@ -401,12 +401,15 @@ async def test_inbound_evolution_filtering_dedup_and_resolution(client, db, user
     resp = await client.post("/webhook/whatsapp", json=poll_vote_payload)
     assert resp.status_code == 200
 
-    # Because show_quantity_selection was triggered for menu_item.id, send_list was called with quantity rows
-    assert state_machine.whatsapp.send_list.called
-    call_args = state_machine.whatsapp.send_list.call_args[0]
+    # Because optimistic add was triggered for menu_item.id, send_buttons was called with the Add-On Hub
+    assert state_machine.whatsapp.send_buttons.called
+    call_args = state_machine.whatsapp.send_buttons.call_args[0]
     assert call_args[0] == phone
-    assert f"*{menu_item.name}*" in call_args[1]
-    assert call_args[4][0]["id"] == f"qty:{menu_item.id}:1"
+    assert menu_item.name in call_args[1]
+    button_ids = [b[0] for b in call_args[2]]
+    assert button_ids[0] == "checkout"
+    assert f"qty_inc:{menu_item.id}:1" in button_ids
+    assert f"qty_menu:{menu_item.id}" in button_ids
 
     # 5. @lid remoteJid with remoteJidAlt (@s.whatsapp.net) is accepted
     lid_payload = {

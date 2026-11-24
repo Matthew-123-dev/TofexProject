@@ -298,8 +298,9 @@ async def quote_order(batch_id: int, payload: QuoteInput) -> dict:
         if not batch.orders:
             raise HTTPException(status_code=404, detail="Payment batch has no orders")
         subtotal = sum((order.subtotal for order in batch.orders), Decimal("0"))
+        pack_fee = getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")
         batch.delivery_fee = payload.fee
-        batch.total_amount = subtotal + payload.fee
+        batch.total_amount = subtotal + pack_fee + payload.fee
         fulfillment.expected_minutes = payload.expected_minutes
         fulfillment.stage = FulfillmentStage.AWAITING_FEE_ACCEPT
         fulfillment.timer_started_at = datetime.now(timezone.utc)  # the customer gets a fresh window to reply
@@ -661,6 +662,7 @@ def _batch(batch) -> dict:
         "status": batch.status.value,
         "total_amount": str(batch.total_amount),
         "delivery_fee": str(batch.delivery_fee),
+        "packaging_fee": str(getattr(batch, "packaging_fee", Decimal("0")) or Decimal("0")),
         "receipt_media_id": batch.receipt_media_id,
         "created_at": batch.created_at.isoformat() if batch.created_at else None,
         "customer": customer_user.name or customer_user.phone_number,

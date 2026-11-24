@@ -213,6 +213,19 @@ def _populate_menu_map(
             mapping[alias] = opt_id
             mapping[alias.lower()] = opt_id
 
+    is_rider_menu = any(str(opt_id).startswith("r:") for opt_id, _ in options)
+    if not is_rider_menu:
+        for shortcut, target_id in (
+            ("0", "cancel"),
+            ("cancel", "cancel"),
+            ("cancel order", "cancel"),
+            ("help", "staff:escalate"),
+            ("staff", "staff:escalate"),
+            ("agent", "staff:escalate"),
+        ):
+            if shortcut not in mapping:
+                mapping[shortcut] = target_id
+
     LAST_MENU_MAP[phone] = mapping
     _LAST_MENU_KIND[phone] = kind
     return poll_values
@@ -233,6 +246,11 @@ def resolve_menu_selection(phone: str, selection: str | None) -> str | None:
 
 def _is_evolution() -> bool:
     return settings.whatsapp_provider.strip().lower() == "evolution"
+
+
+def is_evolution_provider() -> bool:
+    """Public check for provider-aware page sizing across the state machine."""
+    return _is_evolution()
 
 
 def _headers() -> dict[str, str]:

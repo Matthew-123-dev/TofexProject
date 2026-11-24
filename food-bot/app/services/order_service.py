@@ -1,5 +1,7 @@
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,7 +11,50 @@ from app.config import settings
 from app.models import (
     Cart, CartItem, Fulfillment, FulfillmentStage, MenuItem, Order, OrderItem, OrderStatus, PaymentBatch, User,
 )
+from app.services import menu_service
 from app.utils import naira
+
+PACKAGING_SMALL_FEE = Decimal("200.00")
+PACKAGING_BIG_FEE = Decimal("300.00")
+_PROTEIN_CATEGORIES = {"Protein 1", "Protein 2", "Protein 3"}
+_CHICKEN_TURKEY_CATEGORIES = {"Protein 2", "Protein 3"}
+
+
+def is_true_food_item(item: MenuItem) -> bool:
+    """True for rice/spaghetti/porridge main food items (excluding moved Plantain/Moimoi extras)."""
+    return item.category == "Food" and item.name not in menu_service.EXTRAS_MOVED_FROM_FOOD
+
+
+def is_protein_item(item: MenuItem) -> bool:
+    return item.category in _PROTEIN_CATEGORIES or item.name in menu_service.EXTRAS_MOVED_FROM_FOOD
+
+
+def is_chicken_or_turkey(item: MenuItem) -> bool:
+    return item.category in _CHICKEN_TURKEY_CATEGORIES or item.name.lower().startswith(("chicken", "turkey"))
+
+
+def calculate_packaging_fee(lines: Sequence[tuple[Any, MenuItem]]) -> tuple[Decimal, str | None]:
+    """Return `(packaging_fee, pack_size)` for one order/cart of `(line_with_qty, MenuItem)` pairs."""
+    food_portions = 0
+    has_food_or_protein = False
+    has_poultry = False
+    for line, item in lines:
+        qty = getattr(line, "quantity", 0) or 0
+        if qty <= 0 or item is None:
+            continue
+        if is_true_food_item(item):
+            has_food_or_protein = True
+            food_portions += qty
+        elif is_protein_item(item):
+            has_food_or_protein = True
+        if is_chicken_or_turkey(item):
+            has_food_or_protein = True
+            has_poultry = True
+    if not has_food_or_protein:
+        return Decimal("0.00"), None
+    if food_portions > 2 or (food_portions == 2 and has_poultry):
+        return PACKAGING_BIG_FEE, "Big"
+    return PACKAGING_SMALL_FEE, "Small"
 
 
 class CheckoutError(Exception):
@@ -72,6 +117,32 @@ async def add_to_cart(
     await session.flush()
 
 
+async def set_cart_item_quantity(
+    session: AsyncSession, user_id: int, item_id: int, quantity: int, cart_id: int | None = None
+) -> None:
+    """Set exact quantity for `item_id` in user's cart (or remove it when `quantity <= 0`)."""
+    if cart_id is None:
+        cart = await get_or_create_cart(session, user_id)
+    else:
+        cart = await session.get(Cart, cart_id)
+        if cart is None or cart.user_id != user_id:
+            raise ValueError("Cart does not belong to this user")
+    result = await session.execute(
+        select(CartItem).where(CartItem.cart_id == cart.id, CartItem.item_id == item_id)
+    )
+    existing = result.scalar_one_or_none()
+    if quantity <= 0:
+        if existing is not None:
+            await session.delete(existing)
+    else:
+        cart.is_selected = True
+        if existing is not None:
+            existing.quantity = quantity
+        else:
+            session.add(CartItem(cart_id=cart.id, item_id=item_id, quantity=quantity))
+    await session.flush()
+
+
 async def remove_from_cart(session: AsyncSession, cart_id: int, item_id: int) -> None:
     await session.execute(
         delete(CartItem).where(CartItem.cart_id == cart_id, CartItem.item_id == item_id)
@@ -101,19 +172,28 @@ async def get_cart(session: AsyncSession, cart_id: int) -> list[tuple[CartItem, 
     return [(c, m) for c, m in result.all()]
 
 
-async def get_user_cart_summary(session: AsyncSession, user_id: int) -> tuple[int, Decimal]:
-    """Return `(total_items, subtotal)` across the user's selected (or active) carts."""
+async def get_user_cart_totals(session: AsyncSession, user_id: int) -> tuple[int, Decimal, Decimal]:
+    """Return `(total_items, items_subtotal, total_packaging_fee)` across selected (or active) carts."""
     carts = await get_carts(session, user_id)
     if not carts:
-        return 0, Decimal("0")
+        return 0, Decimal("0"), Decimal("0")
     selected = [c for c in carts if c.is_selected]
     target_carts = selected if selected else carts
     total_qty = 0
     total_sub = Decimal("0")
+    total_pack = Decimal("0")
     for c in target_carts:
         lines = await get_cart(session, c.id)
         total_qty += sum(ci.quantity for ci, _ in lines)
         total_sub += cart_subtotal(lines)
+        pack_fee, _ = calculate_packaging_fee(lines)
+        total_pack += pack_fee
+    return total_qty, total_sub, total_pack
+
+
+async def get_user_cart_summary(session: AsyncSession, user_id: int) -> tuple[int, Decimal]:
+    """Return `(total_items, subtotal)` across the user's selected (or active) carts."""
+    total_qty, total_sub, _ = await get_user_cart_totals(session, user_id)
     return total_qty, total_sub
 
 
@@ -134,33 +214,42 @@ async def create_orders_from_carts(session: AsyncSession, user: User, cart_ids: 
     if not cart_lines:
         return None
     _check_stock(cart_lines)
-    subtotal = sum((cart_subtotal(lines) for _, lines in cart_lines), Decimal("0"))
+    orders_list: list[Order] = []
+    subtotal = Decimal("0")
+    total_pack = Decimal("0")
+    for _, lines in cart_lines:
+        order_sub = cart_subtotal(lines)
+        order_pack, _ = calculate_packaging_fee(lines)
+        subtotal += order_sub
+        total_pack += order_pack
+        orders_list.append(
+            Order(
+                user_id=user.id,
+                subtotal=order_sub,
+                delivery_fee=Decimal("0"),
+                packaging_fee=order_pack,
+                total_amount=order_sub + order_pack,
+                status=OrderStatus.PENDING,
+                items=[
+                    OrderItem(
+                        item_id=m.id,
+                        item_name=m.name,
+                        unit_price=m.price,
+                        quantity=c.quantity,
+                        subtotal=m.price * c.quantity,
+                    )
+                    for c, m in lines
+                ],
+            )
+        )
     batch = PaymentBatch(
         user_id=user.id,
         delivery_fee=Decimal("0"),
-        total_amount=subtotal,
+        packaging_fee=total_pack,
+        total_amount=subtotal + total_pack,
         status=OrderStatus.PENDING,
     )
-    batch.orders = [
-        Order(
-            user_id=user.id,
-            subtotal=cart_subtotal(lines),
-            delivery_fee=Decimal("0"),
-            total_amount=cart_subtotal(lines),
-            status=OrderStatus.PENDING,
-            items=[
-                OrderItem(
-                    item_id=m.id,
-                    item_name=m.name,
-                    unit_price=m.price,
-                    quantity=c.quantity,
-                    subtotal=m.price * c.quantity,
-                )
-                for c, m in lines
-            ],
-        )
-        for _, lines in cart_lines
-    ]
+    batch.orders = orders_list
     session.add(batch)
     await session.flush()
     batch.fulfillment = Fulfillment(
@@ -265,8 +354,10 @@ def format_order_summary(order: Order) -> str:
     """Plain-text summary used for the admin alert and the kitchen ticket. Needs items loaded."""
     lines = [f"Order #{order.id}", f"Customer: +{order.user.phone_number}", ""]
     lines += [f"{oi.quantity} x {oi.item_name}" for oi in order.items]
-    lines += ["", f"Items: {naira(order.subtotal)}", f"Delivery: {naira(order.delivery_fee)}",
-              f"Total: {naira(order.total_amount)}"]
+    lines += ["", f"Items: {naira(order.subtotal)}"]
+    if getattr(order, "packaging_fee", Decimal("0")) > 0:
+        lines.append(f"Packaging: {naira(order.packaging_fee)}")
+    lines += [f"Delivery: {naira(order.delivery_fee)}", f"Total: {naira(order.total_amount)}"]
     return "\n".join(lines)
 
 
@@ -275,5 +366,8 @@ def format_batch_summary(batch: PaymentBatch) -> str:
     for order in batch.orders:
         lines.append(f"Order #{order.id}")
         lines.extend(f"{oi.quantity} x {oi.item_name}" for oi in order.items)
-    lines += ["", f"Delivery: {naira(batch.delivery_fee)}", f"Total: {naira(batch.total_amount)}"]
+    lines.append("")
+    if getattr(batch, "packaging_fee", Decimal("0")) > 0:
+        lines.append(f"Packaging: {naira(batch.packaging_fee)}")
+    lines += [f"Delivery: {naira(batch.delivery_fee)}", f"Total: {naira(batch.total_amount)}"]
     return "\n".join(lines)

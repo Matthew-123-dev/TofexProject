@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     bank_account_name: str = ""
 
     brand_name: str = "Tofex Grill and More"
-    outlet_address: str = "[Outlet address - to be added]"
+    outlet_address: str = "Akute Branch (No 8, Ishashi Rd)"
     outlet_phone: str = "[Outlet phone - to be added]"
     support_phone: str = "+2348129579867"
     refund_timeframe: str = "[timeframe - to be added]"

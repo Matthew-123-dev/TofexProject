@@ -1936,6 +1936,9 @@ function detailBlock(o) {
   const f = o.fulfillment;
   if (!f) return '';
   const out = [];
+  if (Number(o.packaging_fee) > 0) {
+    out.push(`<div class="muted">📦 Takeaway pack (${Number(o.packaging_fee) >= 300 ? 'Big' : 'Small'}): <strong>${money(o.packaging_fee)}</strong></div>`);
+  }
   if (f.type === 'pickup') {
     out.push('<div class="muted"><strong>Pickup order</strong> · Collect at the outlet</div>');
   } else if (f.street) {
